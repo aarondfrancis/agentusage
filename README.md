@@ -199,7 +199,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-agentusage = { path = "../agentusage" }
+agentusage = { git = "https://github.com/aarondfrancis/agentusage" }
 ```
 
 Key types re-exported at crate root: `UsageConfig`, `AllResults`, `UsageData`, `UsageEntry`, `ApprovalPolicy`, `PercentKind`.
