@@ -1,21 +1,15 @@
 #![deny(warnings)]
 
-mod dialog;
-mod parser;
-mod tmux;
-mod types;
-
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use std::collections::BTreeMap;
 use std::process::Command;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
-use dialog::{detect_claude_dialog, detect_codex_dialog, detect_gemini_dialog, dialog_error_message, dismiss_dialog};
-use parser::{parse_claude_output, parse_codex_output, parse_gemini_output};
-use tmux::TmuxSession;
-use types::{ApprovalPolicy, DialogKind, PercentKind, UsageData};
+use agentusage::{
+    run_all, run_claude, run_codex, run_gemini, AllResults, ApprovalPolicy, PercentKind,
+    UsageConfig, UsageData,
+};
 
 #[derive(Parser)]
 #[command(
@@ -86,6 +80,17 @@ struct Cli {
     doctor: bool,
 }
 
+impl Cli {
+    fn to_config(&self) -> UsageConfig {
+        UsageConfig {
+            timeout: self.timeout,
+            verbose: self.verbose,
+            approval_policy: self.approval_policy,
+            directory: self.directory.clone(),
+        }
+    }
+}
+
 fn run_doctor() {
     let mut all_ok = true;
 
@@ -106,7 +111,11 @@ fn run_doctor() {
     }
 
     // Check providers
-    for (cmd, name) in [("claude", "Claude Code"), ("codex", "Codex"), ("gemini", "Gemini CLI")] {
+    for (cmd, name) in [
+        ("claude", "Claude Code"),
+        ("codex", "Codex"),
+        ("gemini", "Gemini CLI"),
+    ] {
         match Command::new(cmd).arg("--version").output() {
             Ok(output) if output.status.success() => {
                 let version = String::from_utf8_lossy(&output.stdout);
@@ -128,466 +137,6 @@ fn run_doctor() {
         println!("\nSome dependencies are missing.");
         std::process::exit(1);
     }
-}
-
-fn check_command_exists(cmd: &str) -> Result<()> {
-    match Command::new(cmd).arg("--version").output() {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            bail!("[tool-missing] {} CLI not found. Make sure it is installed and on your PATH.", cmd);
-        }
-        Err(_) => {
-            // Binary exists but --version might not be supported; that's fine
-            Ok(())
-        }
-    }
-}
-
-/// Handle dialog detection and policy for a provider.
-/// Returns Ok(true) if a dialog was found and dismissed (caller should retry wait),
-/// Ok(false) if no dialog found, or Err if dialog found and policy is Fail / not dismissible.
-fn handle_dialog_check<F>(
-    session: &TmuxSession,
-    detect_fn: F,
-    provider: &str,
-    policy: ApprovalPolicy,
-    verbose: bool,
-) -> Result<bool>
-where
-    F: Fn(&str) -> Option<DialogKind>,
-{
-    let content = session.capture_pane()?;
-    if let Some(kind) = detect_fn(&content) {
-        if verbose {
-            eprintln!("[verbose] Dialog detected: {:?}", kind);
-        }
-
-        match policy {
-            ApprovalPolicy::Fail => {
-                bail!("[timeout] {}", dialog_error_message(&kind, provider));
-            }
-            ApprovalPolicy::Accept => {
-                let dismissed = dismiss_dialog(&kind, session)?;
-                if !dismissed {
-                    bail!("[timeout] {}", dialog_error_message(&kind, provider));
-                }
-                if verbose {
-                    eprintln!("[verbose] Dialog dismissed, retrying...");
-                }
-                Ok(true)
-            }
-        }
-    } else {
-        Ok(false)
-    }
-}
-
-/// Return whichever UsageData has more entries.
-fn pick_richer(a: UsageData, b: UsageData) -> UsageData {
-    if a.entries.len() >= b.entries.len() {
-        a
-    } else {
-        b
-    }
-}
-
-fn run_claude(cli: &Cli) -> Result<UsageData> {
-    check_command_exists("claude")?;
-
-    let session = TmuxSession::new(cli.directory.as_deref())?;
-    let poll_interval = Duration::from_millis(500);
-    let prompt_timeout = Duration::from_secs(30);
-    let data_timeout = Duration::from_secs(cli.timeout);
-
-    if cli.verbose {
-        eprintln!("[verbose] Created tmux session: {}", session.name);
-    }
-
-    // Launch claude CLI
-    session.send_keys_literal("claude")?;
-    session.send_keys("Enter")?;
-
-    if cli.verbose {
-        eprintln!("[verbose] Launched claude, waiting for prompt...");
-    }
-
-    let prompt_result = session.wait_for(
-        |content| {
-            let t = content.trim();
-            t.contains('>') || t.contains('❯') || t.contains("Tips")
-        },
-        prompt_timeout,
-        poll_interval,
-        true,
-        cli.verbose,
-    );
-
-    if prompt_result.is_err() {
-        // Check for dialogs before giving up
-        if handle_dialog_check(&session, detect_claude_dialog, "claude", cli.approval_policy, cli.verbose)? {
-            // Dialog dismissed, retry waiting for prompt
-            session.wait_for(
-                |content| {
-                    let t = content.trim();
-                    t.contains('>') || t.contains('❯') || t.contains("Tips")
-                },
-                prompt_timeout,
-                poll_interval,
-                true,
-                cli.verbose,
-            ).context("[timeout] Timed out waiting for Claude prompt after dismissing dialog.")?;
-        } else {
-            return Err(prompt_result.unwrap_err().context(
-                "Timed out waiting for Claude prompt. Is claude authenticated? Try running 'claude' manually."
-            ));
-        }
-    }
-
-    // Wait for TUI to stabilize instead of fixed sleep
-    let _ = session.wait_for_stable(Duration::from_secs(2), poll_interval, cli.verbose);
-
-    if cli.verbose {
-        let content = session.capture_pane()?;
-        eprintln!("[verbose] Prompt detected. Current pane:\n{}", content);
-    }
-
-    // Type /status — triggers autocomplete, then Enter to select and execute
-    session.send_keys_literal("/status")?;
-    std::thread::sleep(Duration::from_millis(800));
-
-    if cli.verbose {
-        let content = session.capture_pane()?;
-        eprintln!("[verbose] After typing /status:\n{}", content);
-    }
-
-    session.send_keys("Enter")?;
-
-    if cli.verbose {
-        eprintln!("[verbose] Sent Enter, waiting for status screen...");
-    }
-
-    // Wait for the actual status screen (not the autocomplete dropdown)
-    session.wait_for(
-        |content| {
-            let has_tabs = content.contains("Config") || content.contains("Usage");
-            let is_autocomplete = content.contains("/statusline") || content.contains("/stats");
-            has_tabs && !is_autocomplete
-        },
-        Duration::from_secs(15),
-        poll_interval,
-        false,
-        cli.verbose,
-    ).context("[timeout] Timed out waiting for status screen")?;
-
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Navigate to Usage tab using Tab key
-    for i in 0..5 {
-        session.send_keys("Tab")?;
-        std::thread::sleep(Duration::from_millis(300));
-
-        let content = session.capture_pane()?;
-        if content.contains("% used") || content.contains("Resets") {
-            if cli.verbose {
-                eprintln!("[verbose] Reached Usage tab after {} Tab presses", i + 1);
-            }
-            break;
-        }
-    }
-
-    if cli.verbose {
-        eprintln!("[verbose] Navigated tabs, waiting for usage data...");
-    }
-
-    let pct_re = regex::Regex::new(r"\d+%\s*used")?;
-    let content = session.wait_for(
-        |content| pct_re.is_match(content),
-        data_timeout,
-        poll_interval,
-        false,
-        cli.verbose,
-    ).context("[timeout] Timed out waiting for usage data. Check your internet connection.")?;
-
-    // Wait for TUI to stabilize instead of fixed sleep
-    let _ = session.wait_for_stable(Duration::from_secs(2), poll_interval, cli.verbose);
-
-    let final_content = session.capture_pane()?;
-
-    if cli.verbose {
-        eprintln!("[verbose] Raw captured text:\n{}", final_content);
-    }
-
-    let data_final = parse_claude_output(&final_content)?;
-    let data_early = parse_claude_output(&content)?;
-    let data = pick_richer(data_final, data_early);
-
-    if data.entries.is_empty() {
-        bail!("[parse-failure] No usage data found in captured output. Run with --verbose to see raw text.");
-    }
-
-    Ok(data)
-}
-
-fn run_codex(cli: &Cli) -> Result<UsageData> {
-    check_command_exists("codex")?;
-
-    let session = TmuxSession::new(cli.directory.as_deref())?;
-    let poll_interval = Duration::from_millis(500);
-    let prompt_timeout = Duration::from_secs(30);
-    let data_timeout = Duration::from_secs(cli.timeout);
-
-    if cli.verbose {
-        eprintln!("[verbose] Created tmux session: {}", session.name);
-    }
-
-    // Launch codex CLI
-    session.send_keys_literal("codex")?;
-    session.send_keys("Enter")?;
-
-    if cli.verbose {
-        eprintln!("[verbose] Launched codex, waiting for prompt...");
-    }
-
-    // Codex prompt shows "› ..." and "? for shortcuts" at the bottom.
-    // Must NOT match ">_" in the Codex banner header which appears early.
-    let prompt_result = session.wait_for(
-        |content| content.contains("? for shortcuts"),
-        prompt_timeout,
-        poll_interval,
-        false,
-        cli.verbose,
-    );
-
-    if prompt_result.is_err() {
-        // Check for dialogs before giving up
-        if handle_dialog_check(&session, detect_codex_dialog, "codex", cli.approval_policy, cli.verbose)? {
-            // Dialog dismissed, retry waiting for prompt
-            session.wait_for(
-                |content| content.contains("? for shortcuts"),
-                prompt_timeout,
-                poll_interval,
-                false,
-                cli.verbose,
-            ).context("[timeout] Timed out waiting for Codex prompt after dismissing dialog.")?;
-        } else {
-            return Err(prompt_result.unwrap_err().context(
-                "Timed out waiting for Codex prompt. Is codex authenticated? Try running 'codex' manually."
-            ));
-        }
-    }
-
-    // Wait for TUI to stabilize instead of fixed sleep
-    let _ = session.wait_for_stable(Duration::from_secs(2), poll_interval, cli.verbose);
-
-    if cli.verbose {
-        let content = session.capture_pane()?;
-        eprintln!("[verbose] Prompt detected. Current pane:\n{}", content);
-    }
-
-    // Codex /status prints inline — no autocomplete, no tabs
-    session.send_keys_literal("/status")?;
-    std::thread::sleep(Duration::from_millis(500));
-    session.send_keys("Enter")?;
-
-    if cli.verbose {
-        eprintln!("[verbose] Sent /status + Enter, waiting for usage data...");
-    }
-
-    // Wait for limit data to appear
-    let limit_re = regex::Regex::new(r"\d+%\s*left")?;
-    let content = session.wait_for(
-        |content| limit_re.is_match(content),
-        data_timeout,
-        poll_interval,
-        false,
-        cli.verbose,
-    ).context("[timeout] Timed out waiting for Codex usage data.")?;
-
-    // Wait for all data to render
-    let _ = session.wait_for_stable(Duration::from_secs(2), poll_interval, cli.verbose);
-
-    let final_content = session.capture_pane()?;
-
-    if cli.verbose {
-        eprintln!("[verbose] Raw captured text:\n{}", final_content);
-    }
-
-    let data_final = parse_codex_output(&final_content)?;
-    let data_early = parse_codex_output(&content)?;
-    let data = pick_richer(data_final, data_early);
-
-    if data.entries.is_empty() {
-        bail!("[parse-failure] No usage data found in captured output. Run with --verbose to see raw text.");
-    }
-
-    Ok(data)
-}
-
-fn run_gemini(cli: &Cli) -> Result<UsageData> {
-    check_command_exists("gemini")?;
-
-    let session = TmuxSession::new(cli.directory.as_deref())?;
-    let poll_interval = Duration::from_millis(500);
-    let prompt_timeout = Duration::from_secs(30);
-    let data_timeout = Duration::from_secs(cli.timeout);
-
-    if cli.verbose {
-        eprintln!("[verbose] Created tmux session: {}", session.name);
-    }
-
-    // Launch gemini CLI
-    session.send_keys_literal("gemini")?;
-    session.send_keys("Enter")?;
-
-    if cli.verbose {
-        eprintln!("[verbose] Launched gemini, waiting for prompt...");
-    }
-
-    // Wait for Gemini prompt — match prompt OR trust dialog so we don't time out
-    let prompt_result = session.wait_for(
-        |content| {
-            content.contains("GEMINI.md")
-                || content.contains("MCP servers")
-                || content.contains("gemini >")
-                || content.contains("Gemini CLI")
-                || content.contains("Do you trust this folder")
-        },
-        prompt_timeout,
-        poll_interval,
-        false,
-        cli.verbose,
-    );
-
-    if prompt_result.is_err() {
-        // Check for dialogs before giving up
-        if handle_dialog_check(&session, detect_gemini_dialog, "gemini", cli.approval_policy, cli.verbose)? {
-            // Dialog dismissed, retry waiting for prompt
-            session.wait_for(
-                |content| {
-                    content.contains("GEMINI.md")
-                        || content.contains("MCP servers")
-                        || content.contains("gemini >")
-                        || content.contains("Gemini CLI")
-                },
-                prompt_timeout,
-                poll_interval,
-                false,
-                cli.verbose,
-            ).context("[timeout] Timed out waiting for Gemini prompt after dismissing dialog.")?;
-        } else {
-            return Err(prompt_result.unwrap_err().context(
-                "Timed out waiting for Gemini prompt. Is gemini authenticated? Try running 'gemini' manually."
-            ));
-        }
-    } else {
-        // wait_for succeeded — check if what we matched was actually a dialog
-        let content = session.capture_pane()?;
-        if let Some(kind) = detect_gemini_dialog(&content) {
-            if cli.verbose {
-                eprintln!("[verbose] Dialog detected after prompt wait: {:?}", kind);
-            }
-            match cli.approval_policy {
-                ApprovalPolicy::Fail => {
-                    bail!("[timeout] {}", dialog_error_message(&kind, "gemini"));
-                }
-                ApprovalPolicy::Accept => {
-                    let dismissed = dismiss_dialog(&kind, &session)?;
-                    if !dismissed {
-                        bail!("[timeout] {}", dialog_error_message(&kind, "gemini"));
-                    }
-                    if cli.verbose {
-                        eprintln!("[verbose] Dialog dismissed, waiting for actual prompt...");
-                    }
-                    // Re-wait for the actual prompt after dialog dismissal
-                    session.wait_for(
-                        |content| {
-                            content.contains("GEMINI.md")
-                                || content.contains("MCP servers")
-                                || content.contains("gemini >")
-                                || content.contains("Gemini CLI")
-                        },
-                        prompt_timeout,
-                        poll_interval,
-                        false,
-                        cli.verbose,
-                    ).context("[timeout] Timed out waiting for Gemini prompt after dismissing dialog.")?;
-                }
-            }
-        }
-    }
-
-    // Wait for TUI to stabilize instead of fixed sleep
-    let _ = session.wait_for_stable(Duration::from_secs(2), poll_interval, cli.verbose);
-
-    if cli.verbose {
-        let content = session.capture_pane()?;
-        eprintln!("[verbose] Prompt detected. Current pane:\n{}", content);
-    }
-
-    // Type /stats session — Gemini uses this command, not /status
-    session.send_keys_literal("/stats session")?;
-    std::thread::sleep(Duration::from_millis(500));
-    session.send_keys("Enter")?;
-
-    if cli.verbose {
-        eprintln!("[verbose] Sent /stats session + Enter, waiting for usage data...");
-    }
-
-    // Wait for usage data to appear
-    let pct_re = regex::Regex::new(r"\d+(?:\.\d+)?%\s*\(Resets?")?;
-    let content = session.wait_for(
-        |content| pct_re.is_match(content),
-        data_timeout,
-        poll_interval,
-        false,
-        cli.verbose,
-    ).context("[timeout] Timed out waiting for Gemini usage data.")?;
-
-    // Wait for all data to render
-    let _ = session.wait_for_stable(Duration::from_secs(2), poll_interval, cli.verbose);
-
-    let final_content = session.capture_pane()?;
-
-    if cli.verbose {
-        eprintln!("[verbose] Raw captured text:\n{}", final_content);
-    }
-
-    let data_final = parse_gemini_output(&final_content)?;
-    let data_early = parse_gemini_output(&content)?;
-    let data = pick_richer(data_final, data_early);
-
-    if data.entries.is_empty() {
-        bail!("[parse-failure] No usage data found in captured output. Run with --verbose to see raw text.");
-    }
-
-    Ok(data)
-}
-
-struct AllResults {
-    results: Vec<UsageData>,
-    warnings: BTreeMap<String, String>,
-}
-
-fn run_all(cli: &Cli) -> AllResults {
-    let mut results = Vec::new();
-    let mut warnings = BTreeMap::new();
-
-    match run_claude(cli) {
-        Ok(data) => results.push(data),
-        Err(e) => { warnings.insert("claude".into(), strip_error_tags(&format!("{:#}", e))); }
-    }
-
-    match run_codex(cli) {
-        Ok(data) => results.push(data),
-        Err(e) => { warnings.insert("codex".into(), strip_error_tags(&format!("{:#}", e))); }
-    }
-
-    match run_gemini(cli) {
-        Ok(data) => results.push(data),
-        Err(e) => { warnings.insert("gemini".into(), strip_error_tags(&format!("{:#}", e))); }
-    }
-
-    AllResults { results, warnings }
 }
 
 fn print_human(data: &UsageData) {
@@ -649,8 +198,14 @@ fn build_provider_json(data: &UsageData) -> serde_json::Value {
     let mut entries = serde_json::Map::new();
     for entry in &data.entries {
         let mut obj = serde_json::Map::new();
-        obj.insert("percent_used".into(), serde_json::json!(entry.percent_used));
-        obj.insert("percent_remaining".into(), serde_json::json!(entry.percent_remaining));
+        obj.insert(
+            "percent_used".into(),
+            serde_json::json!(entry.percent_used),
+        );
+        obj.insert(
+            "percent_remaining".into(),
+            serde_json::json!(entry.percent_remaining),
+        );
         obj.insert("reset_info".into(), serde_json::json!(entry.reset_info));
         if let Some(mins) = entry.reset_minutes {
             obj.insert("reset_minutes".into(), serde_json::json!(mins));
@@ -684,12 +239,19 @@ fn print_json_multi(all: &AllResults) -> Result<()> {
         results.insert(data.provider.clone(), build_provider_json(data));
     }
 
+    // Strip internal tags from warnings for user-facing JSON output
+    let stripped_warnings: BTreeMap<String, String> = all
+        .warnings
+        .iter()
+        .map(|(k, v)| (k.clone(), strip_error_tags(v)))
+        .collect();
+
     let mut wrapper = serde_json::json!({
         "success": true,
         "results": serde_json::Value::Object(results),
     });
-    if !all.warnings.is_empty() {
-        wrapper["warnings"] = serde_json::json!(all.warnings);
+    if !stripped_warnings.is_empty() {
+        wrapper["warnings"] = serde_json::json!(stripped_warnings);
     }
     println!("{}", serde_json::to_string_pretty(&wrapper)?);
     Ok(())
@@ -718,6 +280,7 @@ fn strip_error_tags(msg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentusage::UsageEntry;
 
     // ── exit_code_from_error ────────────────────────────────────────
 
@@ -733,7 +296,10 @@ mod tests {
 
     #[test]
     fn test_exit_code_parse_failure() {
-        assert_eq!(exit_code_from_error("[parse-failure] No usage data found"), 4);
+        assert_eq!(
+            exit_code_from_error("[parse-failure] No usage data found"),
+            4
+        );
     }
 
     #[test]
@@ -749,7 +315,10 @@ mod tests {
     #[test]
     fn test_exit_code_tag_embedded_in_context() {
         // anyhow context wrapping: "outer: [timeout] inner"
-        assert_eq!(exit_code_from_error("Timed out waiting for prompt: [timeout] Timed out after 30s"), 3);
+        assert_eq!(
+            exit_code_from_error("Timed out waiting for prompt: [timeout] Timed out after 30s"),
+            3
+        );
     }
 
     // ── strip_error_tags ────────────────────────────────────────────
@@ -789,125 +358,6 @@ mod tests {
         let msg = "Waiting failed: [timeout] Timed out after 30s";
         let stripped = strip_error_tags(msg);
         assert_eq!(stripped, "Waiting failed: Timed out after 30s");
-    }
-
-    // ── pick_richer ─────────────────────────────────────────────────
-
-    #[test]
-    fn test_pick_richer_first_has_more() {
-        let a = UsageData {
-            provider: "claude".into(),
-            entries: vec![
-                types::UsageEntry {
-                    label: "session".into(),
-                    percent_used: 5,
-                    percent_kind: PercentKind::Used,
-                    reset_info: "Resets 2pm".into(),
-                    percent_remaining: 95, reset_minutes: None,
-                    spent: None,
-                    requests: None,
-                },
-                types::UsageEntry {
-                    label: "week".into(),
-                    percent_used: 10,
-                    percent_kind: PercentKind::Used,
-                    reset_info: "Resets Feb 20".into(),
-                    percent_remaining: 90, reset_minutes: None,
-                    spent: None,
-                    requests: None,
-                },
-            ],
-        };
-        let b = UsageData {
-            provider: "claude".into(),
-            entries: vec![types::UsageEntry {
-                label: "session".into(),
-                percent_used: 5,
-                percent_kind: PercentKind::Used,
-                reset_info: "Resets 2pm".into(),
-                percent_remaining: 95, reset_minutes: None,
-                spent: None,
-                requests: None,
-            }],
-        };
-        let result = pick_richer(a, b);
-        assert_eq!(result.entries.len(), 2);
-    }
-
-    #[test]
-    fn test_pick_richer_second_has_more() {
-        let a = UsageData {
-            provider: "claude".into(),
-            entries: vec![],
-        };
-        let b = UsageData {
-            provider: "claude".into(),
-            entries: vec![types::UsageEntry {
-                label: "session".into(),
-                percent_used: 5,
-                percent_kind: PercentKind::Used,
-                reset_info: "Resets 2pm".into(),
-                percent_remaining: 95, reset_minutes: None,
-                spent: None,
-                requests: None,
-            }],
-        };
-        let result = pick_richer(a, b);
-        assert_eq!(result.entries.len(), 1);
-    }
-
-    #[test]
-    fn test_pick_richer_equal_prefers_first() {
-        let a = UsageData {
-            provider: "claude".into(),
-            entries: vec![types::UsageEntry {
-                label: "from_a".into(),
-                percent_used: 5,
-                percent_kind: PercentKind::Used,
-                reset_info: String::new(),
-                percent_remaining: 95, reset_minutes: None,
-                spent: None,
-                requests: None,
-            }],
-        };
-        let b = UsageData {
-            provider: "claude".into(),
-            entries: vec![types::UsageEntry {
-                label: "from_b".into(),
-                percent_used: 10,
-                percent_kind: PercentKind::Used,
-                reset_info: String::new(),
-                percent_remaining: 90, reset_minutes: None,
-                spent: None,
-                requests: None,
-            }],
-        };
-        let result = pick_richer(a, b);
-        assert_eq!(result.entries[0].label, "from_a");
-    }
-
-    #[test]
-    fn test_pick_richer_both_empty() {
-        let a = UsageData { provider: "claude".into(), entries: vec![] };
-        let b = UsageData { provider: "claude".into(), entries: vec![] };
-        let result = pick_richer(a, b);
-        assert!(result.entries.is_empty());
-    }
-
-    // ── check_command_exists ────────────────────────────────────────
-
-    #[test]
-    fn test_check_command_exists_valid() {
-        // "ls" exists on all unix systems
-        assert!(check_command_exists("ls").is_ok());
-    }
-
-    #[test]
-    fn test_check_command_exists_missing() {
-        let result = check_command_exists("nonexistent_tool_xyz_12345");
-        assert!(result.is_err());
-        let err = format!("{:#}", result.unwrap_err());
-        assert!(err.contains("[tool-missing]"));
     }
 
     // ── CLI flag parsing ──────────────────────────────────────────
@@ -963,12 +413,13 @@ mod tests {
     fn sample_usage(provider: &str) -> UsageData {
         UsageData {
             provider: provider.into(),
-            entries: vec![types::UsageEntry {
+            entries: vec![UsageEntry {
                 label: "session".into(),
                 percent_used: 42,
                 percent_kind: PercentKind::Used,
                 reset_info: "Resets 2pm".into(),
-                percent_remaining: 58, reset_minutes: None,
+                percent_remaining: 58,
+                reset_minutes: None,
                 spent: None,
                 requests: None,
             }],
@@ -985,7 +436,10 @@ mod tests {
         for data in &all.results {
             results.insert(data.provider.clone(), build_provider_json(data));
         }
-        let mut wrapper = serde_json::json!({ "success": true, "results": serde_json::Value::Object(results) });
+        let mut wrapper = serde_json::json!({
+            "success": true,
+            "results": serde_json::Value::Object(results),
+        });
         if !all.warnings.is_empty() {
             wrapper["warnings"] = serde_json::json!(all.warnings);
         }
@@ -1007,7 +461,10 @@ mod tests {
         for data in &all.results {
             results.insert(data.provider.clone(), build_provider_json(data));
         }
-        let mut wrapper = serde_json::json!({ "success": true, "results": serde_json::Value::Object(results) });
+        let mut wrapper = serde_json::json!({
+            "success": true,
+            "results": serde_json::Value::Object(results),
+        });
         if !all.warnings.is_empty() {
             wrapper["warnings"] = serde_json::json!(all.warnings);
         }
@@ -1082,7 +539,7 @@ fn main() {
 
     // Handle --cleanup
     if cli.cleanup {
-        TmuxSession::kill_all_stale_sessions();
+        agentusage::tmux::TmuxSession::kill_all_stale_sessions();
         return;
     }
 
@@ -1094,20 +551,22 @@ fn main() {
 
     // Set up Ctrl+C handler
     ctrlc::set_handler(|| {
-        tmux::SHUTDOWN.store(true, Ordering::SeqCst);
-        tmux::kill_registered_sessions();
+        agentusage::tmux::SHUTDOWN.store(true, Ordering::SeqCst);
+        agentusage::tmux::kill_registered_sessions();
         std::process::exit(130);
     })
     .expect("Failed to set Ctrl+C handler");
 
+    let config = cli.to_config();
+
     if cli.claude || cli.codex || cli.gemini {
         // Single provider mode
         let result = if cli.claude {
-            run_claude(&cli)
+            run_claude(&config)
         } else if cli.codex {
-            run_codex(&cli)
+            run_codex(&config)
         } else {
-            run_gemini(&cli)
+            run_gemini(&config)
         };
 
         match result {
@@ -1138,20 +597,25 @@ fn main() {
         }
     } else {
         // All providers mode
-        let all = run_all(&cli);
+        let all = run_all(&config);
 
         if all.results.is_empty() {
             if cli.json {
+                let stripped_warnings: BTreeMap<String, String> = all
+                    .warnings
+                    .iter()
+                    .map(|(k, v)| (k.clone(), strip_error_tags(v)))
+                    .collect();
                 let wrapper = serde_json::json!({
                     "success": false,
                     "results": {},
-                    "warnings": all.warnings,
+                    "warnings": stripped_warnings,
                     "error": "All providers failed.",
                 });
                 println!("{}", serde_json::to_string_pretty(&wrapper).unwrap());
             } else {
                 for (provider, msg) in &all.warnings {
-                    eprintln!("Warning ({}): {}", provider, msg);
+                    eprintln!("Warning ({}): {}", provider, strip_error_tags(msg));
                 }
                 eprintln!("Error: All providers failed.");
             }
@@ -1165,7 +629,7 @@ fn main() {
             }
         } else {
             for (provider, msg) in &all.warnings {
-                eprintln!("Warning ({}): {}", provider, msg);
+                eprintln!("Warning ({}): {}", provider, strip_error_tags(msg));
             }
             print_human_multi(&all.results);
         }
