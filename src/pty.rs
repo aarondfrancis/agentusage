@@ -113,7 +113,7 @@ impl PtySession {
     pub fn new(directory: Option<&str>, binary: &str, args: &[&str]) -> Result<Self> {
         let mut master_fd: libc::c_int = -1;
         let mut slave_fd: libc::c_int = -1;
-        let mut win = libc::winsize {
+        let win = libc::winsize {
             ws_row: 50,
             ws_col: 200,
             ws_xpixel: 0,
@@ -127,7 +127,7 @@ impl PtySession {
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut win,
+                &win,
             )
         };
         if rc != 0 {
