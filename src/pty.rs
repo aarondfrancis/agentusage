@@ -113,12 +113,13 @@ impl PtySession {
     pub fn new(directory: Option<&str>, binary: &str, args: &[&str]) -> Result<Self> {
         let mut master_fd: libc::c_int = -1;
         let mut slave_fd: libc::c_int = -1;
-        let win = libc::winsize {
+        let mut win = libc::winsize {
             ws_row: 50,
             ws_col: 200,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
+        let win_ptr = std::ptr::addr_of_mut!(win);
 
         // SAFETY: openpty initializes two FDs and optional terminal sizing.
         let rc = unsafe {
@@ -127,7 +128,7 @@ impl PtySession {
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &win,
+                win_ptr,
             )
         };
         if rc != 0 {
