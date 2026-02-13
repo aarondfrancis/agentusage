@@ -44,15 +44,18 @@ pub fn parse_claude_output(text: &str) -> Result<UsageData> {
             let mut spent = None;
 
             let scan_end = (i + 5).min(lines.len());
-            for j in (i + 1)..scan_end {
-                let line = lines[j].trim();
+            for line in &lines[(i + 1)..scan_end] {
+                let line = line.trim();
 
                 if percent.is_none() {
                     if let Some(caps) = pct_re.captures(line) {
                         match caps[1].parse::<f64>() {
                             Ok(v) => percent = Some(v),
                             Err(e) => {
-                                eprintln!("Warning: skipping unparseable percentage '{}': {}", &caps[1], e);
+                                eprintln!(
+                                    "Warning: skipping unparseable percentage '{}': {}",
+                                    &caps[1], e
+                                );
                             }
                         }
                     }
@@ -108,19 +111,21 @@ pub fn parse_claude_output(text: &str) -> Result<UsageData> {
 /// ```
 pub fn parse_codex_output(text: &str) -> Result<UsageData> {
     let limit_re = Regex::new(
-        r"^\s*([\w][\w\s.-]*?)\s*limit:\s+\[.*?\]\s+(\d+(?:\.\d+)?)\s*%\s*(left|used)\s+\(resets?\s+(.+?)\)"
+        r"^\s*([\w][\w\s.-]*?)\s*limit:\s+\[.*?\]\s+(\d+(?:\.\d+)?)\s*%\s*(left|used)\s+\(resets?\s+(.+?)\)",
     )?;
     // Section header: "Something limit:" on its own line (no progress bar)
-    let section_re = Regex::new(
-        r"^\s*([\w][\w\s.-]+?)\s*limit:\s*$"
-    )?;
+    let section_re = Regex::new(r"^\s*([\w][\w\s.-]+?)\s*limit:\s*$")?;
 
     let mut entries = Vec::new();
     let mut current_section: Option<String> = None;
 
     for raw_line in text.lines() {
         // Strip box-drawing characters (│, ╭, ╰, ╮, ╯) from line start/end
-        let line = raw_line.trim().trim_start_matches('│').trim_end_matches('│').trim();
+        let line = raw_line
+            .trim()
+            .trim_start_matches('│')
+            .trim_end_matches('│')
+            .trim();
 
         if line.is_empty() {
             continue;
@@ -142,7 +147,10 @@ pub fn parse_codex_output(text: &str) -> Result<UsageData> {
             let percent = match caps[2].parse::<f64>() {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("Warning: skipping unparseable Codex percentage '{}': {}", &caps[2], e);
+                    eprintln!(
+                        "Warning: skipping unparseable Codex percentage '{}': {}",
+                        &caps[2], e
+                    );
                     continue;
                 }
             };
@@ -177,7 +185,8 @@ pub fn parse_codex_output(text: &str) -> Result<UsageData> {
             && !line.starts_with('╭')
             && !line.starts_with('╰')
             && !line.starts_with('>') // Codex header ">_ OpenAI Codex"
-            && !line.contains(':')    // Key-value metadata lines like "Model:", "Account:"
+            && !line.contains(':')
+        // Key-value metadata lines like "Model:", "Account:"
         {
             current_section = None;
         }
@@ -198,14 +207,18 @@ pub fn parse_codex_output(text: &str) -> Result<UsageData> {
 /// ```
 pub fn parse_gemini_output(text: &str) -> Result<UsageData> {
     let model_re = Regex::new(
-        r"^\s*(gemini-[\w.-]+)\s+(\d+|-)\s+(\d+(?:\.\d+)?)\s*%\s*\(Resets?\s+in\s+(.+?)\)"
+        r"^\s*(gemini-[\w.-]+)\s+(\d+|-)\s+(\d+(?:\.\d+)?)\s*%\s*\(Resets?\s+in\s+(.+?)\)",
     )?;
 
     let mut entries = Vec::new();
 
     for raw_line in text.lines() {
         // Strip box-drawing characters
-        let line = raw_line.trim().trim_start_matches('│').trim_end_matches('│').trim();
+        let line = raw_line
+            .trim()
+            .trim_start_matches('│')
+            .trim_end_matches('│')
+            .trim();
 
         if line.is_empty() {
             continue;
@@ -222,7 +235,10 @@ pub fn parse_gemini_output(text: &str) -> Result<UsageData> {
             let percent = match caps[3].parse::<f64>() {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("Warning: skipping unparseable Gemini percentage '{}': {}", &caps[3], e);
+                    eprintln!(
+                        "Warning: skipping unparseable Gemini percentage '{}': {}",
+                        &caps[3], e
+                    );
                     continue;
                 }
             };
@@ -273,7 +289,10 @@ fn parse_12h_time(s: &str) -> Option<(u32, u32)> {
     let re = Regex::new(r"(?i)(\d{1,2})(?::(\d{2}))?\s*(am|pm)").ok()?;
     let caps = re.captures(s)?;
     let mut hour: u32 = caps[1].parse().ok()?;
-    let min: u32 = caps.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+    let min: u32 = caps
+        .get(2)
+        .and_then(|m| m.as_str().parse().ok())
+        .unwrap_or(0);
     let ampm = caps[3].to_lowercase();
 
     if ampm == "pm" && hour != 12 {
@@ -314,7 +333,8 @@ fn parse_gemini_reset(reset_info: &str) -> Option<i64> {
 
 fn parse_codex_reset(reset_info: &str, now_utc: DateTime<Utc>) -> Option<i64> {
     // "resets 12:07 on 16 Feb"
-    let re_with_date = Regex::new(r"(?i)resets?\s+(\d{1,2}):(\d{2})\s+on\s+(\d{1,2})\s+(\w+)").ok()?;
+    let re_with_date =
+        Regex::new(r"(?i)resets?\s+(\d{1,2}):(\d{2})\s+on\s+(\d{1,2})\s+(\w+)").ok()?;
     if let Some(caps) = re_with_date.captures(reset_info) {
         let hour: u32 = caps[1].parse().ok()?;
         let min: u32 = caps[2].parse().ok()?;
@@ -334,7 +354,9 @@ fn parse_codex_reset(reset_info: &str, now_utc: DateTime<Utc>) -> Option<i64> {
         let reset_utc = reset_local.with_timezone(&Utc);
 
         let minutes = reset_utc.signed_duration_since(now_utc).num_minutes();
-        if minutes < 0 { return None; }
+        if minutes < 0 {
+            return None;
+        }
         return Some(minutes);
     }
 
@@ -391,7 +413,9 @@ fn parse_claude_reset(reset_info: &str, now_utc: DateTime<Utc>) -> Option<i64> {
         let reset_utc = reset_tz.with_timezone(&Utc);
 
         let minutes = reset_utc.signed_duration_since(now_utc).num_minutes();
-        if minutes < 0 { return None; }
+        if minutes < 0 {
+            return None;
+        }
         return Some(minutes);
     }
 
@@ -433,7 +457,9 @@ fn parse_claude_reset(reset_info: &str, now_utc: DateTime<Utc>) -> Option<i64> {
         let reset_utc = reset_tz_dt.with_timezone(&Utc);
 
         let minutes = reset_utc.signed_duration_since(now_utc).num_minutes();
-        if minutes < 0 { return None; }
+        if minutes < 0 {
+            return None;
+        }
         return Some(minutes);
     }
 
@@ -556,7 +582,11 @@ Resets Feb 20 at 9am (America/Chicago)
         let text = "Extra usage\n██░░  50% used\n$1,234.56 / $5,000.00 spent · Resets Mar 1\n";
         let data = parse_claude_output(text).unwrap();
         assert_eq!(data.entries.len(), 1);
-        assert!(data.entries[0].spent.as_ref().unwrap().contains("$1,234.56"));
+        assert!(data.entries[0]
+            .spent
+            .as_ref()
+            .unwrap()
+            .contains("$1,234.56"));
     }
 
     #[test]
@@ -570,7 +600,8 @@ Resets Feb 20 at 9am (America/Chicago)
 
     #[test]
     fn test_claude_reset_on_same_line_as_spent() {
-        let text = "Extra usage\n██  15% used\n$77.33 / $500.00 spent · Resets Mar 1 (America/Chicago)\n";
+        let text =
+            "Extra usage\n██  15% used\n$77.33 / $500.00 spent · Resets Mar 1 (America/Chicago)\n";
         let data = parse_claude_output(text).unwrap();
         assert_eq!(data.entries.len(), 1);
         assert!(data.entries[0].spent.is_some());
@@ -880,7 +911,10 @@ Model-B limit:
         assert_eq!(data1.entries.len(), 1);
         assert_eq!(data2.entries.len(), 1);
         assert_eq!(data1.entries[0].label, data2.entries[0].label);
-        assert_eq!(data1.entries[0].percent_remaining, data2.entries[0].percent_remaining);
+        assert_eq!(
+            data1.entries[0].percent_remaining,
+            data2.entries[0].percent_remaining
+        );
     }
 
     #[test]
@@ -1063,7 +1097,10 @@ Weekly limit:  [████] 80% left (resets 12:00 on 20 Feb)
 
     #[test]
     fn test_gemini_reset_minutes_large() {
-        assert_eq!(parse_reset_minutes("Resets in 23h 58m", "gemini"), Some(1438));
+        assert_eq!(
+            parse_reset_minutes("Resets in 23h 58m", "gemini"),
+            Some(1438)
+        );
     }
 
     #[test]
@@ -1103,7 +1140,8 @@ Weekly limit:  [████] 80% left (resets 12:00 on 20 Feb)
         // "Resets Feb 20 at 9am (America/Chicago)" = 9:00 CST = 15:00 UTC on Feb 20
         // Delta = 7 days + 3 hours = 10260 minutes
         let now = Utc.with_ymd_and_hms(2026, 2, 13, 12, 0, 0).unwrap();
-        let result = parse_reset_minutes_at("Resets Feb 20 at 9am (America/Chicago)", "claude", now);
+        let result =
+            parse_reset_minutes_at("Resets Feb 20 at 9am (America/Chicago)", "claude", now);
         assert_eq!(result, Some(7 * 24 * 60 + 3 * 60));
     }
 
@@ -1149,7 +1187,7 @@ Weekly limit:  [████] 80% left (resets 12:00 on 20 Feb)
         let result = parse_reset_minutes_at(&reset_str, "codex", now);
         assert!(result.is_some());
         let mins = result.unwrap();
-        assert!(mins >= 118 && mins <= 122, "Expected ~120, got {}", mins);
+        assert!((118..=122).contains(&mins), "Expected ~120, got {}", mins);
     }
 
     #[test]

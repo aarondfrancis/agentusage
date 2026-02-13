@@ -43,7 +43,18 @@ impl TmuxSession {
             .subsec_nanos();
         let name = format!("agentusage-{}-{}", std::process::id(), nanos);
 
-        let mut args = vec!["-L", SOCKET_NAME, "new-session", "-d", "-s", &name, "-x", "200", "-y", "50"];
+        let mut args = vec![
+            "-L",
+            SOCKET_NAME,
+            "new-session",
+            "-d",
+            "-s",
+            &name,
+            "-x",
+            "200",
+            "-y",
+            "50",
+        ];
         if let Some(dir) = directory {
             args.push("-c");
             args.push(dir);
@@ -94,7 +105,16 @@ impl TmuxSession {
 
     pub fn capture_pane(&self) -> Result<String> {
         let output = Command::new("tmux")
-            .args(["-L", SOCKET_NAME, "capture-pane", "-t", &self.name, "-p", "-S", "-"])
+            .args([
+                "-L",
+                SOCKET_NAME,
+                "capture-pane",
+                "-t",
+                &self.name,
+                "-p",
+                "-S",
+                "-",
+            ])
             .output()
             .context("Failed to capture tmux pane")?;
 
@@ -131,7 +151,10 @@ impl TmuxSession {
 
             if start.elapsed() > timeout {
                 if verbose {
-                    eprintln!("[verbose] Timeout. Last captured content:\n{}", last_content);
+                    eprintln!(
+                        "[verbose] Timeout. Last captured content:\n{}",
+                        last_content
+                    );
                 }
                 bail!(
                     "[timeout] Timed out after {:.0}s waiting for expected content",
@@ -166,7 +189,12 @@ impl TmuxSession {
 
     /// Wait for the pane content to stabilize (3 consecutive identical captures).
     /// Uses a permissive matcher that accepts any content.
-    pub fn wait_for_stable(&self, timeout: Duration, interval: Duration, verbose: bool) -> Result<String> {
+    pub fn wait_for_stable(
+        &self,
+        timeout: Duration,
+        interval: Duration,
+        verbose: bool,
+    ) -> Result<String> {
         // Use a matcher that always returns true so stabilize logic drives the return
         self.wait_for(|_| true, timeout, interval, true, verbose)
     }
@@ -238,7 +266,10 @@ impl Drop for TmuxSession {
                 eprintln!("Warning: failed to kill tmux session '{}'", self.name);
             }
             Err(e) => {
-                eprintln!("Warning: failed to kill tmux session '{}': {}", self.name, e);
+                eprintln!(
+                    "Warning: failed to kill tmux session '{}': {}",
+                    self.name, e
+                );
             }
             _ => {}
         }

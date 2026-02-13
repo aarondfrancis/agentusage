@@ -105,7 +105,9 @@ fn run_doctor() {
         }
         Err(_) => {
             println!("  tmux: not found");
-            println!("         Install with: brew install tmux (macOS) or apt install tmux (Linux)");
+            println!(
+                "         Install with: brew install tmux (macOS) or apt install tmux (Linux)"
+            );
             all_ok = false;
         }
     }
@@ -198,10 +200,7 @@ fn build_provider_json(data: &UsageData) -> serde_json::Value {
     let mut entries = serde_json::Map::new();
     for entry in &data.entries {
         let mut obj = serde_json::Map::new();
-        obj.insert(
-            "percent_used".into(),
-            serde_json::json!(entry.percent_used),
-        );
+        obj.insert("percent_used".into(), serde_json::json!(entry.percent_used));
         obj.insert(
             "percent_remaining".into(),
             serde_json::json!(entry.percent_remaining),
@@ -277,6 +276,108 @@ fn strip_error_tags(msg: &str) -> String {
         .replace("[parse-failure] ", "")
 }
 
+fn main() {
+    let cli = Cli::parse();
+
+    // Handle --cleanup
+    if cli.cleanup {
+        agentusage::tmux::TmuxSession::kill_all_stale_sessions();
+        return;
+    }
+
+    // Handle --doctor
+    if cli.doctor {
+        run_doctor();
+        return;
+    }
+
+    // Set up Ctrl+C handler
+    ctrlc::set_handler(|| {
+        agentusage::tmux::SHUTDOWN.store(true, Ordering::SeqCst);
+        agentusage::tmux::kill_registered_sessions();
+        std::process::exit(130);
+    })
+    .expect("Failed to set Ctrl+C handler");
+
+    let config = cli.to_config();
+
+    if cli.claude || cli.codex || cli.gemini {
+        // Single provider mode
+        let result = if cli.claude {
+            run_claude(&config)
+        } else if cli.codex {
+            run_codex(&config)
+        } else {
+            run_gemini(&config)
+        };
+
+        match result {
+            Ok(data) => {
+                if cli.json {
+                    if let Err(e) = print_json(&data) {
+                        eprintln!("Error formatting JSON: {}", e);
+                        std::process::exit(1);
+                    }
+                } else {
+                    print_human(&data);
+                }
+            }
+            Err(e) => {
+                let msg = format!("{:#}", e);
+                let code = exit_code_from_error(&msg);
+                if cli.json {
+                    let wrapper = serde_json::json!({
+                        "success": false,
+                        "error": strip_error_tags(&msg),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&wrapper).unwrap());
+                } else {
+                    eprintln!("Error: {}", strip_error_tags(&msg));
+                }
+                std::process::exit(code);
+            }
+        }
+    } else {
+        // All providers mode
+        let all = run_all(&config);
+
+        if all.results.is_empty() {
+            if cli.json {
+                let stripped_warnings: BTreeMap<String, String> = all
+                    .warnings
+                    .iter()
+                    .map(|(k, v)| (k.clone(), strip_error_tags(v)))
+                    .collect();
+                let wrapper = serde_json::json!({
+                    "success": false,
+                    "results": {},
+                    "warnings": stripped_warnings,
+                    "error": "All providers failed.",
+                });
+                println!("{}", serde_json::to_string_pretty(&wrapper).unwrap());
+            } else {
+                for (provider, msg) in &all.warnings {
+                    eprintln!("Warning ({}): {}", provider, strip_error_tags(msg));
+                }
+                eprintln!("Error: All providers failed.");
+            }
+            std::process::exit(1);
+        }
+
+        if cli.json {
+            if let Err(e) = print_json_multi(&all) {
+                eprintln!("Error formatting JSON: {}", e);
+                std::process::exit(1);
+            }
+        } else {
+            for (provider, msg) in &all.warnings {
+                eprintln!("Warning ({}): {}", provider, strip_error_tags(msg));
+            }
+            print_human_multi(&all.results);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,7 +387,10 @@ mod tests {
 
     #[test]
     fn test_exit_code_tool_missing() {
-        assert_eq!(exit_code_from_error("[tool-missing] claude CLI not found"), 2);
+        assert_eq!(
+            exit_code_from_error("[tool-missing] claude CLI not found"),
+            2
+        );
     }
 
     #[test]
@@ -531,107 +635,5 @@ mod tests {
         assert!(!entry.contains_key("reset_minutes"));
         // spent is None, should be absent
         assert!(!entry.contains_key("spent"));
-    }
-}
-
-fn main() {
-    let cli = Cli::parse();
-
-    // Handle --cleanup
-    if cli.cleanup {
-        agentusage::tmux::TmuxSession::kill_all_stale_sessions();
-        return;
-    }
-
-    // Handle --doctor
-    if cli.doctor {
-        run_doctor();
-        return;
-    }
-
-    // Set up Ctrl+C handler
-    ctrlc::set_handler(|| {
-        agentusage::tmux::SHUTDOWN.store(true, Ordering::SeqCst);
-        agentusage::tmux::kill_registered_sessions();
-        std::process::exit(130);
-    })
-    .expect("Failed to set Ctrl+C handler");
-
-    let config = cli.to_config();
-
-    if cli.claude || cli.codex || cli.gemini {
-        // Single provider mode
-        let result = if cli.claude {
-            run_claude(&config)
-        } else if cli.codex {
-            run_codex(&config)
-        } else {
-            run_gemini(&config)
-        };
-
-        match result {
-            Ok(data) => {
-                if cli.json {
-                    if let Err(e) = print_json(&data) {
-                        eprintln!("Error formatting JSON: {}", e);
-                        std::process::exit(1);
-                    }
-                } else {
-                    print_human(&data);
-                }
-            }
-            Err(e) => {
-                let msg = format!("{:#}", e);
-                let code = exit_code_from_error(&msg);
-                if cli.json {
-                    let wrapper = serde_json::json!({
-                        "success": false,
-                        "error": strip_error_tags(&msg),
-                    });
-                    println!("{}", serde_json::to_string_pretty(&wrapper).unwrap());
-                } else {
-                    eprintln!("Error: {}", strip_error_tags(&msg));
-                }
-                std::process::exit(code);
-            }
-        }
-    } else {
-        // All providers mode
-        let all = run_all(&config);
-
-        if all.results.is_empty() {
-            if cli.json {
-                let stripped_warnings: BTreeMap<String, String> = all
-                    .warnings
-                    .iter()
-                    .map(|(k, v)| (k.clone(), strip_error_tags(v)))
-                    .collect();
-                let wrapper = serde_json::json!({
-                    "success": false,
-                    "results": {},
-                    "warnings": stripped_warnings,
-                    "error": "All providers failed.",
-                });
-                println!("{}", serde_json::to_string_pretty(&wrapper).unwrap());
-            } else {
-                for (provider, msg) in &all.warnings {
-                    eprintln!("Warning ({}): {}", provider, strip_error_tags(msg));
-                }
-                eprintln!("Error: All providers failed.");
-            }
-            std::process::exit(1);
-        }
-
-        if cli.json {
-            if let Err(e) = print_json_multi(&all) {
-                eprintln!("Error formatting JSON: {}", e);
-                std::process::exit(1);
-            }
-        } else {
-            for (provider, msg) in &all.warnings {
-                eprintln!("Warning ({}): {}", provider, strip_error_tags(msg));
-            }
-            print_human_multi(&all.results);
-        }
     }
 }

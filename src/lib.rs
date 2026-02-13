@@ -130,7 +130,7 @@ pub fn run_claude(config: &UsageConfig) -> Result<UsageData> {
         config.verbose,
     );
 
-    if prompt_result.is_err() {
+    if let Err(e) = prompt_result {
         // Check for dialogs before giving up
         if handle_dialog_check(
             &session,
@@ -155,7 +155,7 @@ pub fn run_claude(config: &UsageConfig) -> Result<UsageData> {
                     "[timeout] Timed out waiting for Claude prompt after dismissing dialog.",
                 )?;
         } else {
-            return Err(prompt_result.unwrap_err().context(
+            return Err(e.context(
                 "Timed out waiting for Claude prompt. Is claude authenticated? Try running 'claude' manually."
             ));
         }
@@ -189,8 +189,7 @@ pub fn run_claude(config: &UsageConfig) -> Result<UsageData> {
         .wait_for(
             |content| {
                 let has_tabs = content.contains("Config") || content.contains("Usage");
-                let is_autocomplete =
-                    content.contains("/statusline") || content.contains("/stats");
+                let is_autocomplete = content.contains("/statusline") || content.contains("/stats");
                 has_tabs && !is_autocomplete
             },
             Duration::from_secs(15),
@@ -281,7 +280,7 @@ pub fn run_codex(config: &UsageConfig) -> Result<UsageData> {
         config.verbose,
     );
 
-    if prompt_result.is_err() {
+    if let Err(e) = prompt_result {
         // Check for dialogs before giving up
         if handle_dialog_check(
             &session,
@@ -299,11 +298,9 @@ pub fn run_codex(config: &UsageConfig) -> Result<UsageData> {
                     false,
                     config.verbose,
                 )
-                .context(
-                    "[timeout] Timed out waiting for Codex prompt after dismissing dialog.",
-                )?;
+                .context("[timeout] Timed out waiting for Codex prompt after dismissing dialog.")?;
         } else {
-            return Err(prompt_result.unwrap_err().context(
+            return Err(e.context(
                 "Timed out waiting for Codex prompt. Is codex authenticated? Try running 'codex' manually."
             ));
         }
@@ -393,7 +390,7 @@ pub fn run_gemini(config: &UsageConfig) -> Result<UsageData> {
         config.verbose,
     );
 
-    if prompt_result.is_err() {
+    if let Err(e) = prompt_result {
         // Check for dialogs before giving up
         if handle_dialog_check(
             &session,
@@ -420,7 +417,7 @@ pub fn run_gemini(config: &UsageConfig) -> Result<UsageData> {
                     "[timeout] Timed out waiting for Gemini prompt after dismissing dialog.",
                 )?;
         } else {
-            return Err(prompt_result.unwrap_err().context(
+            return Err(e.context(
                 "Timed out waiting for Gemini prompt. Is gemini authenticated? Try running 'gemini' manually."
             ));
         }
