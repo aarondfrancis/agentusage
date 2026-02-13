@@ -4,6 +4,8 @@ Check [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](htt
 
 Launches each CLI tool in a headless tmux session, runs its status command, parses the TUI output, and reports usage percentages, reset times, and spend in a unified format.
 
+**Important:** This tool works by driving your locally installed CLI tools. It does not call any provider APIs directly. This is intentional — calling protected usage/billing APIs from a non-first-party service risks getting your account banned. By using the official CLIs as the interface, agentusage stays within each provider's terms of service.
+
 ## Requirements
 
 - **tmux** - Used to run CLI sessions headlessly
