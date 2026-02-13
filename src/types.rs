@@ -20,8 +20,7 @@ pub enum DialogKind {
     Unknown(String),
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PercentKind {
     Used,
     Left,
@@ -30,9 +29,13 @@ pub enum PercentKind {
 #[derive(Debug, Serialize)]
 pub struct UsageEntry {
     pub label: String,
-    pub percent: f64,
+    pub percent_used: u32,
+    pub percent_remaining: u32,
+    #[serde(skip)]
     pub percent_kind: PercentKind,
     pub reset_info: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_minutes: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -13,7 +13,7 @@ permissions:
   contents: write
 
 jobs:
-  validate:
+  prepare:
     runs-on: ubuntu-latest
     if: github.actor == 'aarondfrancis'
 
@@ -36,8 +36,21 @@ jobs:
           chmod +x .github/scripts/parse-changelog.sh
           .github/scripts/parse-changelog.sh validate
 
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version in Cargo.toml
+        run: |
+          VERSION="${{ inputs.version }}"
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          git add Cargo.toml
+          git commit -m "Bump version to $VERSION" || true
+          git push
+
   build:
-    needs: validate
+    needs: prepare
     strategy:
       matrix:
         include:
@@ -59,6 +72,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Pull latest (includes version bump)
+        run: git pull origin ${{ github.ref_name }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -100,18 +118,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Pull latest (includes version bump)
+        run: git pull origin ${{ github.ref_name }}
+
       - name: Configure git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-      - name: Update Cargo.toml version
-        run: |
-          VERSION="${{ inputs.version }}"
-          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
-          git add Cargo.toml
-          git commit -m "Bump version to $VERSION" || true
-          git push
 
       - name: Create and push tag
         run: |

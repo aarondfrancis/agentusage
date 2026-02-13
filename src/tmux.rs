@@ -15,7 +15,7 @@ pub struct TmuxSession {
 }
 
 impl TmuxSession {
-    pub fn new() -> Result<Self> {
+    pub fn new(directory: Option<&str>) -> Result<Self> {
         // Check tmux is available
         Command::new("tmux")
             .arg("-V")
@@ -28,8 +28,14 @@ impl TmuxSession {
             .subsec_nanos();
         let name = format!("agentusage-{}-{}", std::process::id(), nanos);
 
+        let mut args = vec!["-L", SOCKET_NAME, "new-session", "-d", "-s", &name, "-x", "200", "-y", "50"];
+        if let Some(dir) = directory {
+            args.push("-c");
+            args.push(dir);
+        }
+
         let status = Command::new("tmux")
-            .args(["-L", SOCKET_NAME, "new-session", "-d", "-s", &name, "-x", "200", "-y", "50"])
+            .args(&args)
             .status()
             .context("Failed to create tmux session")?;
 

@@ -1,4 +1,6 @@
 use anyhow::Result;
+use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, Utc};
+use chrono_tz::Tz;
 use regex::Regex;
 
 use crate::types::{PercentKind, UsageData, UsageEntry};
@@ -70,11 +72,14 @@ pub fn parse_claude_output(text: &str) -> Result<UsageData> {
             }
 
             if let Some(pct) = percent {
+                let reset_minutes = parse_reset_minutes(&reset_info, "claude");
                 entries.push(UsageEntry {
                     label,
-                    percent: pct,
+                    percent_used: pct.round() as u32,
+                    percent_remaining: 100 - pct.round() as u32,
                     percent_kind: PercentKind::Used,
                     reset_info,
+                    reset_minutes,
                     spent,
                     requests: None,
                 });
@@ -147,11 +152,18 @@ pub fn parse_codex_output(text: &str) -> Result<UsageData> {
             };
             let reset_info = format!("resets {}", &caps[4]);
 
+            let (percent_used, percent_remaining) = match percent_kind {
+                PercentKind::Used => (percent.round() as u32, 100 - percent.round() as u32),
+                PercentKind::Left => (100 - percent.round() as u32, percent.round() as u32),
+            };
+            let reset_minutes = parse_reset_minutes(&reset_info, "codex");
             entries.push(UsageEntry {
                 label,
-                percent,
+                percent_used,
+                percent_remaining,
                 percent_kind,
                 reset_info,
+                reset_minutes,
                 spent: None,
                 requests: None,
             });
@@ -214,11 +226,14 @@ pub fn parse_gemini_output(text: &str) -> Result<UsageData> {
             };
             let reset_info = format!("Resets in {}", &caps[4]);
 
+            let reset_minutes = parse_reset_minutes(&reset_info, "gemini");
             entries.push(UsageEntry {
                 label,
-                percent,
+                percent_used: 100 - percent.round() as u32,
+                percent_remaining: percent.round() as u32,
                 percent_kind: PercentKind::Left,
                 reset_info,
+                reset_minutes,
                 spent: None,
                 requests,
             });
@@ -229,6 +244,206 @@ pub fn parse_gemini_output(text: &str) -> Result<UsageData> {
         provider: "gemini".to_string(),
         entries,
     })
+}
+
+// ── Reset time parsing ──────────────────────────────────────────
+
+fn parse_month(s: &str) -> Option<u32> {
+    match s.to_lowercase().as_str() {
+        "jan" | "january" => Some(1),
+        "feb" | "february" => Some(2),
+        "mar" | "march" => Some(3),
+        "apr" | "april" => Some(4),
+        "may" => Some(5),
+        "jun" | "june" => Some(6),
+        "jul" | "july" => Some(7),
+        "aug" | "august" => Some(8),
+        "sep" | "september" => Some(9),
+        "oct" | "october" => Some(10),
+        "nov" | "november" => Some(11),
+        "dec" | "december" => Some(12),
+        _ => None,
+    }
+}
+
+fn parse_12h_time(s: &str) -> Option<(u32, u32)> {
+    let re = Regex::new(r"(?i)(\d{1,2})(?::(\d{2}))?\s*(am|pm)").ok()?;
+    let caps = re.captures(s)?;
+    let mut hour: u32 = caps[1].parse().ok()?;
+    let min: u32 = caps.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+    let ampm = caps[3].to_lowercase();
+
+    if ampm == "pm" && hour != 12 {
+        hour += 12;
+    } else if ampm == "am" && hour == 12 {
+        hour = 0;
+    }
+
+    if hour > 23 || min > 59 {
+        return None;
+    }
+
+    Some((hour, min))
+}
+
+fn parse_gemini_reset(reset_info: &str) -> Option<i64> {
+    // "Resets in 3h 3m"
+    let re_hm = Regex::new(r"(\d+)h\s*(\d+)m").ok()?;
+    if let Some(caps) = re_hm.captures(reset_info) {
+        let hours: i64 = caps[1].parse().ok()?;
+        let minutes: i64 = caps[2].parse().ok()?;
+        return Some(hours * 60 + minutes);
+    }
+    // "Resets in 3h"
+    let re_h = Regex::new(r"(\d+)h").ok()?;
+    if let Some(caps) = re_h.captures(reset_info) {
+        let hours: i64 = caps[1].parse().ok()?;
+        return Some(hours * 60);
+    }
+    // "Resets in 45m"
+    let re_m = Regex::new(r"(\d+)m").ok()?;
+    if let Some(caps) = re_m.captures(reset_info) {
+        let minutes: i64 = caps[1].parse().ok()?;
+        return Some(minutes);
+    }
+    None
+}
+
+fn parse_codex_reset(reset_info: &str, now_utc: DateTime<Utc>) -> Option<i64> {
+    // "resets 12:07 on 16 Feb"
+    let re_with_date = Regex::new(r"(?i)resets?\s+(\d{1,2}):(\d{2})\s+on\s+(\d{1,2})\s+(\w+)").ok()?;
+    if let Some(caps) = re_with_date.captures(reset_info) {
+        let hour: u32 = caps[1].parse().ok()?;
+        let min: u32 = caps[2].parse().ok()?;
+        let day: u32 = caps[3].parse().ok()?;
+        let month = parse_month(&caps[4])?;
+
+        let now_local = now_utc.with_timezone(&Local);
+        let year = now_local.date_naive().year();
+
+        let reset_date = NaiveDate::from_ymd_opt(year, month, day)?;
+        let reset_time = NaiveTime::from_hms_opt(hour, min, 0)?;
+        let reset_naive = reset_date.and_time(reset_time);
+        let reset_local = reset_naive.and_local_timezone(Local).single()?;
+        let reset_utc = reset_local.with_timezone(&Utc);
+
+        let minutes = reset_utc.signed_duration_since(now_utc).num_minutes();
+        if minutes < 0 { return None; }
+        return Some(minutes);
+    }
+
+    // "resets 16:25"
+    let re_time = Regex::new(r"(?i)resets?\s+(\d{1,2}):(\d{2})").ok()?;
+    if let Some(caps) = re_time.captures(reset_info) {
+        let hour: u32 = caps[1].parse().ok()?;
+        let min: u32 = caps[2].parse().ok()?;
+
+        let now_local = now_utc.with_timezone(&Local);
+        let today = now_local.date_naive();
+        let reset_time = NaiveTime::from_hms_opt(hour, min, 0)?;
+
+        let reset_naive = today.and_time(reset_time);
+        let reset_local = reset_naive.and_local_timezone(Local).single()?;
+        let mut reset_utc = reset_local.with_timezone(&Utc);
+
+        if reset_utc <= now_utc {
+            let tomorrow = today.succ_opt()?;
+            let reset_naive = tomorrow.and_time(reset_time);
+            let reset_local = reset_naive.and_local_timezone(Local).single()?;
+            reset_utc = reset_local.with_timezone(&Utc);
+        }
+
+        return Some(reset_utc.signed_duration_since(now_utc).num_minutes());
+    }
+
+    None
+}
+
+fn parse_claude_reset(reset_info: &str, now_utc: DateTime<Utc>) -> Option<i64> {
+    // Extract timezone from parentheses
+    let tz_re = Regex::new(r"\(([^)]+)\)").ok()?;
+    let tz_str = tz_re.captures(reset_info)?.get(1)?.as_str();
+    let tz: Tz = tz_str.parse().ok()?;
+
+    let now_tz = now_utc.with_timezone(&tz);
+
+    // "Resets Feb 20 at 9am (...)"
+    let date_time_re = Regex::new(r"(?i)Resets?\s+(\w+)\s+(\d{1,2})\s+at\s+(.+?)\s*\(").ok()?;
+    if let Some(caps) = date_time_re.captures(reset_info) {
+        let month = parse_month(&caps[1])?;
+        let day: u32 = caps[2].parse().ok()?;
+        let (hour, min) = parse_12h_time(&caps[3])?;
+
+        let year = now_tz.date_naive().year();
+        let reset_date = NaiveDate::from_ymd_opt(year, month, day)?;
+        let reset_time = NaiveTime::from_hms_opt(hour, min, 0)?;
+        let reset_naive = reset_date.and_time(reset_time);
+        let reset_tz = reset_naive.and_local_timezone(tz).single()?;
+        let reset_utc = reset_tz.with_timezone(&Utc);
+
+        let minutes = reset_utc.signed_duration_since(now_utc).num_minutes();
+        if minutes < 0 { return None; }
+        return Some(minutes);
+    }
+
+    // "Resets 2pm (...)" - time only (today, wraps to tomorrow if past)
+    let time_re = Regex::new(r"(?i)Resets?\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm))\s*\(").ok()?;
+    if let Some(caps) = time_re.captures(reset_info) {
+        let (hour, min) = parse_12h_time(&caps[1])?;
+
+        let today = now_tz.date_naive();
+        let reset_time = NaiveTime::from_hms_opt(hour, min, 0)?;
+        let reset_naive = today.and_time(reset_time);
+        let reset_tz_dt = reset_naive.and_local_timezone(tz).single()?;
+        let mut reset_utc = reset_tz_dt.with_timezone(&Utc);
+
+        if reset_utc <= now_utc {
+            let tomorrow = today.succ_opt()?;
+            let reset_naive = tomorrow.and_time(reset_time);
+            let reset_tz_dt = reset_naive.and_local_timezone(tz).single()?;
+            reset_utc = reset_tz_dt.with_timezone(&Utc);
+        }
+
+        return Some(reset_utc.signed_duration_since(now_utc).num_minutes());
+    }
+
+    // "Resets Mar 1 (...)" - date only
+    let date_re = Regex::new(r"(?i)Resets?\s+(\w+)\s+(\d{1,2})\s*\(").ok()?;
+    if let Some(caps) = date_re.captures(reset_info) {
+        let month = parse_month(&caps[1])?;
+        let day: u32 = caps[2].parse().ok()?;
+
+        let year = now_tz.date_naive().year();
+        let reset_date = NaiveDate::from_ymd_opt(year, month, day)?;
+        let reset_time = NaiveTime::from_hms_opt(0, 0, 0)?;
+        let reset_naive = reset_date.and_time(reset_time);
+        let reset_tz_dt = reset_naive.and_local_timezone(tz).single()?;
+        let reset_utc = reset_tz_dt.with_timezone(&Utc);
+
+        let minutes = reset_utc.signed_duration_since(now_utc).num_minutes();
+        if minutes < 0 { return None; }
+        return Some(minutes);
+    }
+
+    None
+}
+
+/// Parse reset_info into minutes until reset. Testable variant that accepts a controlled "now".
+fn parse_reset_minutes_at(reset_info: &str, provider: &str, now_utc: DateTime<Utc>) -> Option<i64> {
+    if reset_info.is_empty() {
+        return None;
+    }
+    match provider {
+        "gemini" => parse_gemini_reset(reset_info),
+        "codex" => parse_codex_reset(reset_info, now_utc),
+        "claude" => parse_claude_reset(reset_info, now_utc),
+        _ => None,
+    }
+}
+
+/// Parse reset_info string into minutes until reset.
+pub fn parse_reset_minutes(reset_info: &str, provider: &str) -> Option<i64> {
+    parse_reset_minutes_at(reset_info, provider, Utc::now())
 }
 
 #[cfg(test)]
@@ -264,17 +479,17 @@ $77.33 / $500.00 spent · Resets Mar 1 (America/Chicago)
         assert_eq!(data.entries.len(), 4);
 
         assert_eq!(data.entries[0].label, "Current session");
-        assert_eq!(data.entries[0].percent, 1.0);
+        assert_eq!(data.entries[0].percent_used, 1);
         assert_eq!(data.entries[0].percent_kind, PercentKind::Used);
         assert!(data.entries[0].reset_info.contains("Resets 2pm"));
 
         assert_eq!(data.entries[1].label, "Current week (all models)");
-        assert_eq!(data.entries[1].percent, 0.0);
+        assert_eq!(data.entries[1].percent_used, 0);
 
         assert_eq!(data.entries[2].label, "Current week (Sonnet only)");
 
         assert_eq!(data.entries[3].label, "Extra usage");
-        assert_eq!(data.entries[3].percent, 15.0);
+        assert_eq!(data.entries[3].percent_used, 15);
         assert!(data.entries[3].spent.is_some());
         assert!(data.entries[3].spent.as_ref().unwrap().contains("$77.33"));
     }
@@ -290,7 +505,7 @@ $77.33 / $500.00 spent · Resets Mar 1 (America/Chicago)
         let text = "Current session\n██░░░░  12.5% used\nResets 3pm (America/Chicago)\n";
         let data = parse_claude_output(text).unwrap();
         assert_eq!(data.entries.len(), 1);
-        assert_eq!(data.entries[0].percent, 12.5);
+        assert_eq!(data.entries[0].percent_used, 13);
     }
 
     #[test]
@@ -337,7 +552,7 @@ Resets Feb 20 at 9am (America/Chicago)
         let text = "   Current session\n   ██░░  10% used\n   Resets 5pm (US/Eastern)\n";
         let data = parse_claude_output(text).unwrap();
         assert_eq!(data.entries.len(), 1);
-        assert_eq!(data.entries[0].percent, 10.0);
+        assert_eq!(data.entries[0].percent_used, 10);
         assert!(data.entries[0].reset_info.contains("Resets 5pm"));
     }
 
@@ -382,9 +597,11 @@ Resets Feb 20
             provider: "claude".to_string(),
             entries: vec![crate::types::UsageEntry {
                 label: "Current session".to_string(),
-                percent: 5.0,
+                percent_used: 5,
                 percent_kind: PercentKind::Used,
                 reset_info: "Resets 2pm".to_string(),
+                percent_remaining: 95,
+                reset_minutes: None,
                 spent: None,
                 requests: None,
             }],
@@ -399,9 +616,11 @@ Resets Feb 20
             provider: "claude".to_string(),
             entries: vec![crate::types::UsageEntry {
                 label: "Extra usage".to_string(),
-                percent: 15.0,
+                percent_used: 15,
                 percent_kind: PercentKind::Used,
                 reset_info: "Resets Mar 1".to_string(),
+                percent_remaining: 85,
+                reset_minutes: None,
                 spent: Some("$77.33 / $500.00 spent".to_string()),
                 requests: None,
             }],
@@ -433,19 +652,19 @@ Resets Feb 20
         assert_eq!(data.entries.len(), 4);
 
         assert_eq!(data.entries[0].label, "5h limit");
-        assert_eq!(data.entries[0].percent, 97.0);
+        assert_eq!(data.entries[0].percent_remaining, 97);
         assert_eq!(data.entries[0].percent_kind, PercentKind::Left);
         assert_eq!(data.entries[0].reset_info, "resets 11:07");
 
         assert_eq!(data.entries[1].label, "Weekly limit");
-        assert_eq!(data.entries[1].percent, 71.0);
+        assert_eq!(data.entries[1].percent_remaining, 71);
         assert_eq!(data.entries[1].reset_info, "resets 12:07 on 16 Feb");
 
         assert_eq!(data.entries[2].label, "GPT-5.3-Codex-Spark 5h limit");
-        assert_eq!(data.entries[2].percent, 100.0);
+        assert_eq!(data.entries[2].percent_remaining, 100);
 
         assert_eq!(data.entries[3].label, "GPT-5.3-Codex-Spark Weekly limit");
-        assert_eq!(data.entries[3].percent, 100.0);
+        assert_eq!(data.entries[3].percent_remaining, 100);
     }
 
     #[test]
@@ -459,7 +678,7 @@ Resets Feb 20
         let text = "5h limit:  [██████] 50% left (resets 14:00)\n";
         let data = parse_codex_output(text).unwrap();
         assert_eq!(data.entries.len(), 1);
-        assert_eq!(data.entries[0].percent, 50.0);
+        assert_eq!(data.entries[0].percent_remaining, 50);
     }
 
     #[test]
@@ -474,7 +693,7 @@ Resets Feb 20
         let text = "  5h limit:    [████] 80% left (resets 09:30)\n";
         let data = parse_codex_output(text).unwrap();
         assert_eq!(data.entries.len(), 1);
-        assert_eq!(data.entries[0].percent, 80.0);
+        assert_eq!(data.entries[0].percent_remaining, 80);
     }
 
     #[test]
@@ -482,7 +701,7 @@ Resets Feb 20
         let text = "Weekly limit:  [██] 33.5% left (resets 12:00 on 20 Feb)\n";
         let data = parse_codex_output(text).unwrap();
         assert_eq!(data.entries.len(), 1);
-        assert_eq!(data.entries[0].percent, 33.5);
+        assert_eq!(data.entries[0].percent_remaining, 34);
     }
 
     #[test]
@@ -532,7 +751,7 @@ Some-Model limit:
         let data = parse_codex_output(text).unwrap();
         assert_eq!(data.entries.len(), 1);
         assert_eq!(data.entries[0].label, "5h limit");
-        assert_eq!(data.entries[0].percent, 80.0);
+        assert_eq!(data.entries[0].percent_remaining, 80);
     }
 
     #[test]
@@ -541,16 +760,17 @@ Some-Model limit:
             provider: "codex".to_string(),
             entries: vec![crate::types::UsageEntry {
                 label: "5h limit".to_string(),
-                percent: 97.0,
+                percent_used: 3,
                 percent_kind: PercentKind::Left,
                 reset_info: "resets 11:07".to_string(),
+                percent_remaining: 97,
+                reset_minutes: None,
                 spent: None,
                 requests: None,
             }],
         };
         let json = serde_json::to_string(&data).unwrap();
         assert!(json.contains("\"codex\""));
-        assert!(json.contains("\"left\""));
         assert!(json.contains("97"));
         assert!(!json.contains("spent"));
     }
@@ -588,7 +808,7 @@ Model-B limit:
         assert_eq!(data.entries.len(), 5);
 
         assert_eq!(data.entries[0].label, "gemini-2.5-flash-lite");
-        assert_eq!(data.entries[0].percent, 99.9);
+        assert_eq!(data.entries[0].percent_remaining, 100);
         assert_eq!(data.entries[0].percent_kind, PercentKind::Left);
         assert_eq!(data.entries[0].requests, Some("2".to_string()));
         assert_eq!(data.entries[0].reset_info, "Resets in 23h 58m");
@@ -597,7 +817,7 @@ Model-B limit:
         assert_eq!(data.entries[1].requests, Some("4".to_string()));
 
         assert_eq!(data.entries[3].label, "gemini-2.5-pro");
-        assert_eq!(data.entries[3].percent, 98.1);
+        assert_eq!(data.entries[3].percent_remaining, 98);
         assert_eq!(data.entries[3].requests, None);
 
         assert_eq!(data.entries[4].label, "gemini-3-pro-preview");
@@ -616,7 +836,7 @@ Model-B limit:
         let data = parse_gemini_output(text).unwrap();
         assert_eq!(data.entries.len(), 1);
         assert_eq!(data.entries[0].label, "gemini-2.5-flash");
-        assert_eq!(data.entries[0].percent, 95.0);
+        assert_eq!(data.entries[0].percent_remaining, 95);
         assert_eq!(data.entries[0].requests, Some("3".to_string()));
     }
 
@@ -633,7 +853,7 @@ Model-B limit:
         let text = "│  gemini-2.5-flash-lite   2   99.9% (Resets in 23h 58m)\n";
         let data = parse_gemini_output(text).unwrap();
         assert_eq!(data.entries.len(), 1);
-        assert_eq!(data.entries[0].percent, 99.9);
+        assert_eq!(data.entries[0].percent_remaining, 100);
     }
 
     #[test]
@@ -648,7 +868,7 @@ Model-B limit:
         assert_eq!(data1.entries.len(), 1);
         assert_eq!(data2.entries.len(), 1);
         assert_eq!(data1.entries[0].label, data2.entries[0].label);
-        assert_eq!(data1.entries[0].percent, data2.entries[0].percent);
+        assert_eq!(data1.entries[0].percent_remaining, data2.entries[0].percent_remaining);
     }
 
     #[test]
@@ -657,17 +877,18 @@ Model-B limit:
             provider: "gemini".to_string(),
             entries: vec![crate::types::UsageEntry {
                 label: "gemini-2.5-flash".to_string(),
-                percent: 99.3,
+                percent_used: 1,
                 percent_kind: PercentKind::Left,
                 reset_info: "Resets in 4h 49m".to_string(),
+                percent_remaining: 99,
+                reset_minutes: Some(289),
                 spent: None,
                 requests: Some("6".to_string()),
             }],
         };
         let json = serde_json::to_string(&data).unwrap();
         assert!(json.contains("\"gemini\""));
-        assert!(json.contains("\"left\""));
-        assert!(json.contains("99.3"));
+        assert!(json.contains("\"percent_remaining\":99"));
         assert!(json.contains("\"requests\":\"6\""));
         assert!(!json.contains("spent"));
     }
@@ -678,9 +899,11 @@ Model-B limit:
             provider: "gemini".to_string(),
             entries: vec![crate::types::UsageEntry {
                 label: "gemini-2.5-pro".to_string(),
-                percent: 98.1,
+                percent_used: 2,
                 percent_kind: PercentKind::Left,
                 reset_info: "Resets in 2h 35m".to_string(),
+                percent_remaining: 98,
+                reset_minutes: Some(155),
                 spent: None,
                 requests: None,
             }],
@@ -737,5 +960,187 @@ Weekly limit:  [████] 80% left (resets 12:00 on 20 Feb)
 ";
         let data = parse_gemini_output(text).unwrap();
         assert_eq!(data.entries.len(), 2);
+    }
+
+    // ── Normalized / reset_minutes tests ────────────────────────────
+
+    #[test]
+    fn test_gemini_reset_minutes_hours_and_minutes() {
+        assert_eq!(parse_reset_minutes("Resets in 3h 3m", "gemini"), Some(183));
+    }
+
+    #[test]
+    fn test_gemini_reset_minutes_hours_only() {
+        assert_eq!(parse_reset_minutes("Resets in 5h", "gemini"), Some(300));
+    }
+
+    #[test]
+    fn test_gemini_reset_minutes_minutes_only() {
+        assert_eq!(parse_reset_minutes("Resets in 45m", "gemini"), Some(45));
+    }
+
+    #[test]
+    fn test_gemini_reset_minutes_large() {
+        assert_eq!(parse_reset_minutes("Resets in 23h 58m", "gemini"), Some(1438));
+    }
+
+    #[test]
+    fn test_reset_minutes_empty_string() {
+        assert_eq!(parse_reset_minutes("", "gemini"), None);
+        assert_eq!(parse_reset_minutes("", "codex"), None);
+        assert_eq!(parse_reset_minutes("", "claude"), None);
+    }
+
+    #[test]
+    fn test_reset_minutes_unparseable() {
+        assert_eq!(parse_reset_minutes("some garbage", "claude"), None);
+        assert_eq!(parse_reset_minutes("no time here", "codex"), None);
+        assert_eq!(parse_reset_minutes("nothing useful", "gemini"), None);
+    }
+
+    #[test]
+    fn test_reset_minutes_unknown_provider() {
+        assert_eq!(parse_reset_minutes("Resets in 3h 3m", "unknown"), None);
+    }
+
+    #[test]
+    fn test_claude_reset_minutes_time_with_tz() {
+        use chrono::TimeZone;
+        // 12:00 UTC on Feb 13, 2026. America/Chicago is CST (UTC-6) in February.
+        // "Resets 2pm (America/Chicago)" = 14:00 CST = 20:00 UTC
+        // Delta = 8 hours = 480 minutes
+        let now = Utc.with_ymd_and_hms(2026, 2, 13, 12, 0, 0).unwrap();
+        let result = parse_reset_minutes_at("Resets 2pm (America/Chicago)", "claude", now);
+        assert_eq!(result, Some(480));
+    }
+
+    #[test]
+    fn test_claude_reset_minutes_date_time_with_tz() {
+        use chrono::TimeZone;
+        // 12:00 UTC on Feb 13, 2026
+        // "Resets Feb 20 at 9am (America/Chicago)" = 9:00 CST = 15:00 UTC on Feb 20
+        // Delta = 7 days + 3 hours = 10260 minutes
+        let now = Utc.with_ymd_and_hms(2026, 2, 13, 12, 0, 0).unwrap();
+        let result = parse_reset_minutes_at("Resets Feb 20 at 9am (America/Chicago)", "claude", now);
+        assert_eq!(result, Some(7 * 24 * 60 + 3 * 60));
+    }
+
+    #[test]
+    fn test_claude_reset_minutes_date_only_with_tz() {
+        use chrono::TimeZone;
+        // 12:00 UTC on Feb 13, 2026
+        // "Resets Mar 1 (America/Chicago)" = 00:00 CST Mar 1 = 06:00 UTC Mar 1
+        // Delta from Feb 13 12:00 UTC to Mar 1 06:00 UTC = 15 days 18 hours = 22680 min
+        let now = Utc.with_ymd_and_hms(2026, 2, 13, 12, 0, 0).unwrap();
+        let result = parse_reset_minutes_at("Resets Mar 1 (America/Chicago)", "claude", now);
+        assert_eq!(result, Some(15 * 24 * 60 + 18 * 60));
+    }
+
+    #[test]
+    fn test_claude_reset_minutes_no_tz_returns_none() {
+        // No timezone in parentheses → cannot compute
+        assert_eq!(parse_reset_minutes("Resets 2pm", "claude"), None);
+    }
+
+    #[test]
+    fn test_claude_reset_minutes_past_time_wraps_to_tomorrow() {
+        use chrono::TimeZone;
+        // 22:00 UTC on Feb 13, 2026. America/Chicago is CST (UTC-6).
+        // Local time = 16:00 CST. "Resets 2pm" = 14:00 CST = already past today.
+        // Should wrap to tomorrow: 14:00 CST Feb 14 = 20:00 UTC Feb 14
+        // Delta from 22:00 UTC Feb 13 to 20:00 UTC Feb 14 = 22 hours = 1320 minutes
+        let now = Utc.with_ymd_and_hms(2026, 2, 13, 22, 0, 0).unwrap();
+        let result = parse_reset_minutes_at("Resets 2pm (America/Chicago)", "claude", now);
+        assert_eq!(result, Some(22 * 60));
+    }
+
+    #[test]
+    fn test_codex_reset_minutes_time_only() {
+        use chrono::Timelike;
+        // Construct a reset time ~2 hours from now in local time
+        let now = Utc::now();
+        let local_now = now.with_timezone(&Local);
+        let future_hour = (local_now.hour() + 2) % 24;
+        let future_min = local_now.minute();
+        let reset_str = format!("resets {:02}:{:02}", future_hour, future_min);
+
+        let result = parse_reset_minutes_at(&reset_str, "codex", now);
+        assert!(result.is_some());
+        let mins = result.unwrap();
+        assert!(mins >= 118 && mins <= 122, "Expected ~120, got {}", mins);
+    }
+
+    #[test]
+    fn test_codex_reset_minutes_with_date() {
+        use chrono::TimeZone;
+        // This test is timezone-dependent but should return Some with positive minutes
+        let now = Utc.with_ymd_and_hms(2026, 2, 13, 10, 0, 0).unwrap();
+        let result = parse_reset_minutes_at("resets 12:07 on 16 Feb", "codex", now);
+        // Result depends on local tz, but Feb 16 is after Feb 13 so should be positive
+        assert!(result.is_some());
+        assert!(result.unwrap() > 0);
+    }
+
+    #[test]
+    fn test_normalized_percent_remaining_used() {
+        let text = "Current session\n██░░  25% used\nResets 3pm (America/Chicago)\n";
+        let data = parse_claude_output(text).unwrap();
+        assert_eq!(data.entries[0].percent_remaining, 75);
+    }
+
+    #[test]
+    fn test_normalized_percent_remaining_left() {
+        let text = "5h limit:  [████] 80% left (resets 09:30)\n";
+        let data = parse_codex_output(text).unwrap();
+        assert_eq!(data.entries[0].percent_remaining, 80);
+    }
+
+    #[test]
+    fn test_normalized_in_json_output() {
+        let data = crate::types::UsageData {
+            provider: "gemini".to_string(),
+            entries: vec![crate::types::UsageEntry {
+                label: "gemini-2.5-flash".to_string(),
+                percent_used: 1,
+                percent_kind: PercentKind::Left,
+                reset_info: "Resets in 4h 49m".to_string(),
+                percent_remaining: 99,
+                reset_minutes: Some(289),
+                spent: None,
+                requests: Some("6".to_string()),
+            }],
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        assert!(json.contains("\"percent_remaining\":99"));
+        assert!(json.contains("\"reset_minutes\":289"));
+    }
+
+    #[test]
+    fn test_normalized_reset_minutes_null_in_json() {
+        let data = crate::types::UsageData {
+            provider: "claude".to_string(),
+            entries: vec![crate::types::UsageEntry {
+                label: "session".to_string(),
+                percent_used: 5,
+                percent_kind: PercentKind::Used,
+                reset_info: "Resets 2pm".to_string(),
+                percent_remaining: 95,
+                reset_minutes: None,
+                spent: None,
+                requests: None,
+            }],
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        assert!(json.contains("\"percent_remaining\":95"));
+        // reset_minutes is None and should be skipped
+        assert!(!json.contains("reset_minutes"));
+    }
+
+    #[test]
+    fn test_gemini_parser_populates_normalized() {
+        let text = "│  gemini-2.5-flash   6   99.3% (Resets in 4h 49m)\n";
+        let data = parse_gemini_output(text).unwrap();
+        assert_eq!(data.entries[0].percent_remaining, 99);
+        assert_eq!(data.entries[0].reset_minutes, Some(289));
     }
 }

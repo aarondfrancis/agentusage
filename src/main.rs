@@ -18,39 +18,114 @@ use tmux::TmuxSession;
 use types::{ApprovalPolicy, DialogKind, PercentKind, UsageData};
 
 #[derive(Parser)]
-#[command(name = "agentusage", about = "Check Claude Code, Codex, and Gemini CLI usage limits")]
+#[command(
+    name = "agentusage",
+    version,
+    about = "Check Claude Code, Codex, and Gemini CLI usage limits",
+    long_about = "Check Claude Code, Codex, and Gemini CLI usage limits.\n\n\
+        Launches each CLI tool in a tmux session, runs its usage/limits command,\n\
+        parses the output, and reports usage percentages, reset times, and spend.\n\n\
+        By default, checks all installed providers. Use --claude, --codex, or\n\
+        --gemini to check a single provider.",
+    after_help = "\
+Examples:
+  agentusage                  Check all installed providers
+  agentusage --claude         Check only Claude Code
+  agentusage --json           Output as machine-readable JSON
+  agentusage --claude --json  Single provider, JSON output
+  agentusage --timeout 60     Wait up to 60s for data
+  agentusage -C ~/project     Run CLI sessions in ~/project
+  agentusage --cleanup        Kill stale tmux sessions and exit
+
+Exit codes:
+  0  Success
+  1  One or more providers failed
+  2  All providers failed or infrastructure error"
+)]
 struct Cli {
     /// Check only Claude Code usage
-    #[arg(long)]
+    #[arg(long, help_heading = "Providers")]
     claude: bool,
 
     /// Check only Codex usage
-    #[arg(long)]
+    #[arg(long, help_heading = "Providers")]
     codex: bool,
 
     /// Check only Gemini CLI usage
-    #[arg(long)]
+    #[arg(long, help_heading = "Providers")]
     gemini: bool,
 
     /// Output as JSON
     #[arg(long)]
     json: bool,
 
-    /// Max time to wait for data in seconds
-    #[arg(long, default_value = "45")]
+    /// Max seconds to wait for data [default: 45]
+    #[arg(long, default_value = "45", hide_default_value = true)]
     timeout: u64,
 
     /// Print debug info (raw captured text, timing)
     #[arg(long)]
     verbose: bool,
 
-    /// How to handle interactive dialogs (trust, update, terms)
-    #[arg(long, value_enum, default_value = "fail")]
+    /// How to handle interactive dialogs (trust, update, terms) [default: fail]
+    #[arg(long, value_enum, default_value = "fail", hide_default_value = true)]
     approval_policy: ApprovalPolicy,
+
+    /// Working directory for the CLI sessions
+    #[arg(long, short = 'C')]
+    directory: Option<String>,
 
     /// Kill all stale agentusage tmux sessions and exit
     #[arg(long)]
     cleanup: bool,
+
+    /// Check if tmux is installed and exit
+    #[arg(long)]
+    doctor: bool,
+}
+
+fn run_doctor() {
+    let mut all_ok = true;
+
+    // Check tmux
+    match Command::new("tmux").arg("-V").output() {
+        Ok(output) if output.status.success() => {
+            let version = String::from_utf8_lossy(&output.stdout);
+            println!("  tmux: {}", version.trim());
+        }
+        Ok(_) => {
+            println!("  tmux: installed (unknown version)");
+        }
+        Err(_) => {
+            println!("  tmux: not found");
+            println!("         Install with: brew install tmux (macOS) or apt install tmux (Linux)");
+            all_ok = false;
+        }
+    }
+
+    // Check providers
+    for (cmd, name) in [("claude", "Claude Code"), ("codex", "Codex"), ("gemini", "Gemini CLI")] {
+        match Command::new(cmd).arg("--version").output() {
+            Ok(output) if output.status.success() => {
+                let version = String::from_utf8_lossy(&output.stdout);
+                println!("  {}: {}", name, version.trim());
+            }
+            Ok(_) => {
+                println!("  {}: installed (unknown version)", name);
+            }
+            Err(_) => {
+                println!("  {}: not found", name);
+                all_ok = false;
+            }
+        }
+    }
+
+    if all_ok {
+        println!("\nAll dependencies found.");
+    } else {
+        println!("\nSome dependencies are missing.");
+        std::process::exit(1);
+    }
 }
 
 fn check_command_exists(cmd: &str) -> Result<()> {
@@ -117,7 +192,7 @@ fn pick_richer(a: UsageData, b: UsageData) -> UsageData {
 fn run_claude(cli: &Cli) -> Result<UsageData> {
     check_command_exists("claude")?;
 
-    let session = TmuxSession::new()?;
+    let session = TmuxSession::new(cli.directory.as_deref())?;
     let poll_interval = Duration::from_millis(500);
     let prompt_timeout = Duration::from_secs(30);
     let data_timeout = Duration::from_secs(cli.timeout);
@@ -254,7 +329,7 @@ fn run_claude(cli: &Cli) -> Result<UsageData> {
 fn run_codex(cli: &Cli) -> Result<UsageData> {
     check_command_exists("codex")?;
 
-    let session = TmuxSession::new()?;
+    let session = TmuxSession::new(cli.directory.as_deref())?;
     let poll_interval = Duration::from_millis(500);
     let prompt_timeout = Duration::from_secs(30);
     let data_timeout = Duration::from_secs(cli.timeout);
@@ -349,7 +424,7 @@ fn run_codex(cli: &Cli) -> Result<UsageData> {
 fn run_gemini(cli: &Cli) -> Result<UsageData> {
     check_command_exists("gemini")?;
 
-    let session = TmuxSession::new()?;
+    let session = TmuxSession::new(cli.directory.as_deref())?;
     let poll_interval = Duration::from_millis(500);
     let prompt_timeout = Duration::from_secs(30);
     let data_timeout = Duration::from_secs(cli.timeout);
@@ -523,9 +598,9 @@ fn print_human(data: &UsageData) {
     println!("{}", "─".repeat(60));
 
     for entry in &data.entries {
-        let kind = match entry.percent_kind {
-            PercentKind::Used => "used",
-            PercentKind::Left => "left",
+        let (display_pct, kind) = match entry.percent_kind {
+            PercentKind::Used => (entry.percent_used, "used"),
+            PercentKind::Left => (entry.percent_remaining, "left"),
         };
 
         let spent_str = entry
@@ -549,7 +624,7 @@ fn print_human(data: &UsageData) {
         println!(
             "{:<30} {:>5}% {}{}{}{}",
             format!("{}:", entry.label),
-            entry.percent,
+            display_pct,
             kind,
             requests_str,
             spent_str,
@@ -567,13 +642,50 @@ fn print_human_multi(results: &[UsageData]) {
     }
 }
 
+/// Build a JSON object for a single provider: { label: { ...fields }, ... }
+fn build_provider_json(data: &UsageData) -> serde_json::Value {
+    let mut entries = serde_json::Map::new();
+    for entry in &data.entries {
+        let mut obj = serde_json::Map::new();
+        obj.insert("percent_used".into(), serde_json::json!(entry.percent_used));
+        obj.insert("percent_remaining".into(), serde_json::json!(entry.percent_remaining));
+        obj.insert("reset_info".into(), serde_json::json!(entry.reset_info));
+        if let Some(mins) = entry.reset_minutes {
+            obj.insert("reset_minutes".into(), serde_json::json!(mins));
+        }
+        if let Some(ref spent) = entry.spent {
+            obj.insert("spent".into(), serde_json::json!(spent));
+        }
+        if let Some(ref requests) = entry.requests {
+            obj.insert("requests".into(), serde_json::json!(requests));
+        }
+        entries.insert(entry.label.clone(), serde_json::Value::Object(obj));
+    }
+    serde_json::Value::Object(entries)
+}
+
 fn print_json(data: &UsageData) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(data)?);
+    let mut results = serde_json::Map::new();
+    results.insert(data.provider.clone(), build_provider_json(data));
+
+    let wrapper = serde_json::json!({
+        "success": true,
+        "results": serde_json::Value::Object(results),
+    });
+    println!("{}", serde_json::to_string_pretty(&wrapper)?);
     Ok(())
 }
 
 fn print_json_multi(all: &AllResults) -> Result<()> {
-    let mut wrapper = serde_json::json!({ "results": all.results });
+    let mut results = serde_json::Map::new();
+    for data in &all.results {
+        results.insert(data.provider.clone(), build_provider_json(data));
+    }
+
+    let mut wrapper = serde_json::json!({
+        "success": true,
+        "results": serde_json::Value::Object(results),
+    });
     if !all.warnings.is_empty() {
         wrapper["warnings"] = serde_json::json!(all.warnings);
     }
@@ -686,17 +798,19 @@ mod tests {
             entries: vec![
                 types::UsageEntry {
                     label: "session".into(),
-                    percent: 5.0,
+                    percent_used: 5,
                     percent_kind: PercentKind::Used,
                     reset_info: "Resets 2pm".into(),
+                    percent_remaining: 95, reset_minutes: None,
                     spent: None,
                     requests: None,
                 },
                 types::UsageEntry {
                     label: "week".into(),
-                    percent: 10.0,
+                    percent_used: 10,
                     percent_kind: PercentKind::Used,
                     reset_info: "Resets Feb 20".into(),
+                    percent_remaining: 90, reset_minutes: None,
                     spent: None,
                     requests: None,
                 },
@@ -706,9 +820,10 @@ mod tests {
             provider: "claude".into(),
             entries: vec![types::UsageEntry {
                 label: "session".into(),
-                percent: 5.0,
+                percent_used: 5,
                 percent_kind: PercentKind::Used,
                 reset_info: "Resets 2pm".into(),
+                percent_remaining: 95, reset_minutes: None,
                 spent: None,
                 requests: None,
             }],
@@ -727,9 +842,10 @@ mod tests {
             provider: "claude".into(),
             entries: vec![types::UsageEntry {
                 label: "session".into(),
-                percent: 5.0,
+                percent_used: 5,
                 percent_kind: PercentKind::Used,
                 reset_info: "Resets 2pm".into(),
+                percent_remaining: 95, reset_minutes: None,
                 spent: None,
                 requests: None,
             }],
@@ -744,9 +860,10 @@ mod tests {
             provider: "claude".into(),
             entries: vec![types::UsageEntry {
                 label: "from_a".into(),
-                percent: 5.0,
+                percent_used: 5,
                 percent_kind: PercentKind::Used,
                 reset_info: String::new(),
+                percent_remaining: 95, reset_minutes: None,
                 spent: None,
                 requests: None,
             }],
@@ -755,9 +872,10 @@ mod tests {
             provider: "claude".into(),
             entries: vec![types::UsageEntry {
                 label: "from_b".into(),
-                percent: 10.0,
+                percent_used: 10,
                 percent_kind: PercentKind::Used,
                 reset_info: String::new(),
+                percent_remaining: 90, reset_minutes: None,
                 spent: None,
                 requests: None,
             }],
@@ -844,9 +962,10 @@ mod tests {
             provider: provider.into(),
             entries: vec![types::UsageEntry {
                 label: "session".into(),
-                percent: 42.0,
+                percent_used: 42,
                 percent_kind: PercentKind::Used,
                 reset_info: "Resets 2pm".into(),
+                percent_remaining: 58, reset_minutes: None,
                 spent: None,
                 requests: None,
             }],
@@ -859,11 +978,17 @@ mod tests {
             results: vec![sample_usage("claude")],
             warnings: BTreeMap::new(),
         };
-        let mut wrapper = serde_json::json!({ "results": all.results });
+        let mut results = serde_json::Map::new();
+        for data in &all.results {
+            results.insert(data.provider.clone(), build_provider_json(data));
+        }
+        let mut wrapper = serde_json::json!({ "success": true, "results": serde_json::Value::Object(results) });
         if !all.warnings.is_empty() {
             wrapper["warnings"] = serde_json::json!(all.warnings);
         }
-        assert!(wrapper.get("results").unwrap().is_array());
+        assert_eq!(wrapper.get("success").unwrap(), true);
+        assert!(wrapper.get("results").unwrap().is_object());
+        assert!(wrapper["results"].get("claude").is_some());
         assert!(wrapper.get("warnings").is_none());
     }
 
@@ -875,11 +1000,16 @@ mod tests {
             results: vec![sample_usage("claude")],
             warnings,
         };
-        let mut wrapper = serde_json::json!({ "results": all.results });
+        let mut results = serde_json::Map::new();
+        for data in &all.results {
+            results.insert(data.provider.clone(), build_provider_json(data));
+        }
+        let mut wrapper = serde_json::json!({ "success": true, "results": serde_json::Value::Object(results) });
         if !all.warnings.is_empty() {
             wrapper["warnings"] = serde_json::json!(all.warnings);
         }
-        assert!(wrapper.get("results").unwrap().is_array());
+        assert_eq!(wrapper.get("success").unwrap(), true);
+        assert!(wrapper["results"].get("claude").is_some());
         let warnings = wrapper.get("warnings").unwrap().as_object().unwrap();
         assert_eq!(warnings.len(), 1);
         assert!(warnings.contains_key("codex"));
@@ -894,11 +1024,21 @@ mod tests {
             results: vec![sample_usage("claude"), sample_usage("gemini")],
             warnings,
         };
-        let wrapper = serde_json::json!({ "results": all.results, "warnings": all.warnings });
-        let results = wrapper["results"].as_array().unwrap();
+        let mut results = serde_json::Map::new();
+        for data in &all.results {
+            results.insert(data.provider.clone(), build_provider_json(data));
+        }
+        let wrapper = serde_json::json!({
+            "results": serde_json::Value::Object(results),
+            "warnings": all.warnings,
+        });
+        let results = wrapper["results"].as_object().unwrap();
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0]["provider"], "claude");
-        assert_eq!(results[1]["provider"], "gemini");
+        assert!(results.contains_key("claude"));
+        assert!(results.contains_key("gemini"));
+        // Each provider has a "session" label entry
+        assert!(wrapper["results"]["claude"]["session"].is_object());
+        assert_eq!(wrapper["results"]["claude"]["session"]["percent_used"], 42);
         assert_eq!(wrapper["warnings"]["codex"], "tool not found");
     }
 
@@ -915,6 +1055,23 @@ mod tests {
         assert!(all.results.is_empty());
         assert_eq!(all.warnings.len(), 3);
     }
+
+    #[test]
+    fn test_build_provider_json_structure() {
+        let data = sample_usage("claude");
+        let json = build_provider_json(&data);
+        let obj = json.as_object().unwrap();
+        // Key is the label
+        assert!(obj.contains_key("session"));
+        let entry = obj["session"].as_object().unwrap();
+        assert_eq!(entry["percent_used"], 42);
+        assert!(!entry.contains_key("percent_kind"));
+        assert_eq!(entry["percent_remaining"], 58);
+        // reset_minutes is None, should be absent
+        assert!(!entry.contains_key("reset_minutes"));
+        // spent is None, should be absent
+        assert!(!entry.contains_key("spent"));
+    }
 }
 
 fn main() {
@@ -923,6 +1080,12 @@ fn main() {
     // Handle --cleanup
     if cli.cleanup {
         TmuxSession::kill_all_stale_sessions();
+        return;
+    }
+
+    // Handle --doctor
+    if cli.doctor {
+        run_doctor();
         return;
     }
 
@@ -961,7 +1124,15 @@ fn main() {
             Err(e) => {
                 let msg = format!("{:#}", e);
                 let code = exit_code_from_error(&msg);
-                eprintln!("Error: {}", strip_error_tags(&msg));
+                if cli.json {
+                    let wrapper = serde_json::json!({
+                        "success": false,
+                        "error": strip_error_tags(&msg),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&wrapper).unwrap());
+                } else {
+                    eprintln!("Error: {}", strip_error_tags(&msg));
+                }
                 std::process::exit(code);
             }
         }
@@ -972,7 +1143,8 @@ fn main() {
         if all.results.is_empty() {
             if cli.json {
                 let wrapper = serde_json::json!({
-                    "results": [],
+                    "success": false,
+                    "results": {},
                     "warnings": all.warnings,
                     "error": "All providers failed.",
                 });
