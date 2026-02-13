@@ -126,12 +126,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Create and push tag
-        run: |
-          VERSION="${{ inputs.version }}"
-          git tag "v$VERSION"
-          git push origin "v$VERSION"
-
       - name: Update changelog
         run: |
           VERSION="${{ inputs.version }}"
@@ -144,6 +138,12 @@ jobs:
           git add CHANGELOG.md
           git commit -m "Update changelog for v$VERSION"
           git push
+
+      - name: Create and push tag
+        run: |
+          VERSION="${{ inputs.version }}"
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4

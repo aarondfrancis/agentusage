@@ -73,10 +73,11 @@ pub fn parse_claude_output(text: &str) -> Result<UsageData> {
 
             if let Some(pct) = percent {
                 let reset_minutes = parse_reset_minutes(&reset_info, "claude");
+                let used = (pct.round() as u32).min(100);
                 entries.push(UsageEntry {
                     label,
-                    percent_used: pct.round() as u32,
-                    percent_remaining: 100 - pct.round() as u32,
+                    percent_used: used,
+                    percent_remaining: 100 - used,
                     percent_kind: PercentKind::Used,
                     reset_info,
                     reset_minutes,
@@ -152,9 +153,10 @@ pub fn parse_codex_output(text: &str) -> Result<UsageData> {
             };
             let reset_info = format!("resets {}", &caps[4]);
 
+            let clamped = (percent.round() as u32).min(100);
             let (percent_used, percent_remaining) = match percent_kind {
-                PercentKind::Used => (percent.round() as u32, 100 - percent.round() as u32),
-                PercentKind::Left => (100 - percent.round() as u32, percent.round() as u32),
+                PercentKind::Used => (clamped, 100 - clamped),
+                PercentKind::Left => (100 - clamped, clamped),
             };
             let reset_minutes = parse_reset_minutes(&reset_info, "codex");
             entries.push(UsageEntry {
@@ -227,10 +229,11 @@ pub fn parse_gemini_output(text: &str) -> Result<UsageData> {
             let reset_info = format!("Resets in {}", &caps[4]);
 
             let reset_minutes = parse_reset_minutes(&reset_info, "gemini");
+            let clamped = (percent.round() as u32).min(100);
             entries.push(UsageEntry {
                 label,
-                percent_used: 100 - percent.round() as u32,
-                percent_remaining: percent.round() as u32,
+                percent_used: 100 - clamped,
+                percent_remaining: clamped,
                 percent_kind: PercentKind::Left,
                 reset_info,
                 reset_minutes,
@@ -321,7 +324,10 @@ fn parse_codex_reset(reset_info: &str, now_utc: DateTime<Utc>) -> Option<i64> {
         let now_local = now_utc.with_timezone(&Local);
         let year = now_local.date_naive().year();
 
-        let reset_date = NaiveDate::from_ymd_opt(year, month, day)?;
+        let mut reset_date = NaiveDate::from_ymd_opt(year, month, day)?;
+        if reset_date < now_local.date_naive() {
+            reset_date = NaiveDate::from_ymd_opt(year + 1, month, day)?;
+        }
         let reset_time = NaiveTime::from_hms_opt(hour, min, 0)?;
         let reset_naive = reset_date.and_time(reset_time);
         let reset_local = reset_naive.and_local_timezone(Local).single()?;
@@ -375,7 +381,10 @@ fn parse_claude_reset(reset_info: &str, now_utc: DateTime<Utc>) -> Option<i64> {
         let (hour, min) = parse_12h_time(&caps[3])?;
 
         let year = now_tz.date_naive().year();
-        let reset_date = NaiveDate::from_ymd_opt(year, month, day)?;
+        let mut reset_date = NaiveDate::from_ymd_opt(year, month, day)?;
+        if reset_date < now_tz.date_naive() {
+            reset_date = NaiveDate::from_ymd_opt(year + 1, month, day)?;
+        }
         let reset_time = NaiveTime::from_hms_opt(hour, min, 0)?;
         let reset_naive = reset_date.and_time(reset_time);
         let reset_tz = reset_naive.and_local_timezone(tz).single()?;
@@ -414,7 +423,10 @@ fn parse_claude_reset(reset_info: &str, now_utc: DateTime<Utc>) -> Option<i64> {
         let day: u32 = caps[2].parse().ok()?;
 
         let year = now_tz.date_naive().year();
-        let reset_date = NaiveDate::from_ymd_opt(year, month, day)?;
+        let mut reset_date = NaiveDate::from_ymd_opt(year, month, day)?;
+        if reset_date < now_tz.date_naive() {
+            reset_date = NaiveDate::from_ymd_opt(year + 1, month, day)?;
+        }
         let reset_time = NaiveTime::from_hms_opt(0, 0, 0)?;
         let reset_naive = reset_date.and_time(reset_time);
         let reset_tz_dt = reset_naive.and_local_timezone(tz).single()?;
@@ -911,6 +923,76 @@ Model-B limit:
         let json = serde_json::to_string(&data).unwrap();
         assert!(!json.contains("requests"));
         assert!(!json.contains("spent"));
+    }
+
+    // ── Percentage clamping tests ─────────────────────────────────
+
+    #[test]
+    fn test_claude_percentage_over_100_clamped() {
+        let text = "Current session\n██░░  105% used\nResets 2pm (America/Chicago)\n";
+        let data = parse_claude_output(text).unwrap();
+        assert_eq!(data.entries.len(), 1);
+        assert_eq!(data.entries[0].percent_used, 100);
+        assert_eq!(data.entries[0].percent_remaining, 0);
+    }
+
+    #[test]
+    fn test_codex_percentage_over_100_used_clamped() {
+        let text = "5h limit:  [████] 110% used (resets 14:00)\n";
+        let data = parse_codex_output(text).unwrap();
+        assert_eq!(data.entries.len(), 1);
+        assert_eq!(data.entries[0].percent_used, 100);
+        assert_eq!(data.entries[0].percent_remaining, 0);
+    }
+
+    #[test]
+    fn test_codex_percentage_over_100_left_clamped() {
+        let text = "5h limit:  [████] 105% left (resets 14:00)\n";
+        let data = parse_codex_output(text).unwrap();
+        assert_eq!(data.entries.len(), 1);
+        assert_eq!(data.entries[0].percent_remaining, 100);
+        assert_eq!(data.entries[0].percent_used, 0);
+    }
+
+    #[test]
+    fn test_gemini_percentage_over_100_clamped() {
+        let text = "│  gemini-2.5-flash   3   105.0% (Resets in 1h 30m)\n";
+        let data = parse_gemini_output(text).unwrap();
+        assert_eq!(data.entries.len(), 1);
+        assert_eq!(data.entries[0].percent_remaining, 100);
+        assert_eq!(data.entries[0].percent_used, 0);
+    }
+
+    // ── Year rollover tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_codex_reset_year_rollover() {
+        use chrono::TimeZone;
+        // Dec 31, 2026 at 23:00 UTC. "resets 10:00 on 2 Jan" should be Jan 2, 2027
+        let now = Utc.with_ymd_and_hms(2026, 12, 31, 23, 0, 0).unwrap();
+        let result = parse_reset_minutes_at("resets 10:00 on 2 Jan", "codex", now);
+        assert!(result.is_some());
+        assert!(result.unwrap() > 0);
+    }
+
+    #[test]
+    fn test_claude_reset_date_time_year_rollover() {
+        use chrono::TimeZone;
+        // Dec 31, 2026 at 23:00 UTC. "Resets Jan 5 at 9am (UTC)" should be Jan 5, 2027
+        let now = Utc.with_ymd_and_hms(2026, 12, 31, 23, 0, 0).unwrap();
+        let result = parse_reset_minutes_at("Resets Jan 5 at 9am (UTC)", "claude", now);
+        assert!(result.is_some());
+        assert!(result.unwrap() > 0);
+    }
+
+    #[test]
+    fn test_claude_reset_date_only_year_rollover() {
+        use chrono::TimeZone;
+        // Dec 31, 2026 at 23:00 UTC. "Resets Jan 10 (UTC)" should be Jan 10, 2027
+        let now = Utc.with_ymd_and_hms(2026, 12, 31, 23, 0, 0).unwrap();
+        let result = parse_reset_minutes_at("Resets Jan 10 (UTC)", "claude", now);
+        assert!(result.is_some());
+        assert!(result.unwrap() > 0);
     }
 
     // ── Parse-error-skip tests ──────────────────────────────────────

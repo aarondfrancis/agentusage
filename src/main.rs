@@ -39,20 +39,22 @@ Examples:
 
 Exit codes:
   0  Success
-  1  One or more providers failed
-  2  All providers failed or infrastructure error"
+  1  General error
+  2  Required tool not found (tmux or provider CLI)
+  3  Timeout waiting for provider output
+  4  Failed to parse provider output"
 )]
 struct Cli {
     /// Check only Claude Code usage
-    #[arg(long, help_heading = "Providers")]
+    #[arg(long, help_heading = "Providers", conflicts_with_all = ["codex", "gemini"])]
     claude: bool,
 
     /// Check only Codex usage
-    #[arg(long, help_heading = "Providers")]
+    #[arg(long, help_heading = "Providers", conflicts_with_all = ["claude", "gemini"])]
     codex: bool,
 
     /// Check only Gemini CLI usage
-    #[arg(long, help_heading = "Providers")]
+    #[arg(long, help_heading = "Providers", conflicts_with_all = ["claude", "codex"])]
     gemini: bool,
 
     /// Output as JSON
@@ -79,7 +81,7 @@ struct Cli {
     #[arg(long)]
     cleanup: bool,
 
-    /// Check if tmux is installed and exit
+    /// Check if tmux and provider CLIs are installed
     #[arg(long)]
     doctor: bool,
 }
@@ -941,11 +943,12 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_flags_no_conflict() {
-        // Multiple provider flags should parse without error (even if main() only uses first match)
-        let cli = Cli::try_parse_from(["agentusage", "--claude", "--codex"]).unwrap();
-        assert!(cli.claude);
-        assert!(cli.codex);
+    fn test_cli_conflicting_provider_flags_error() {
+        // Multiple provider flags should produce a clap error
+        assert!(Cli::try_parse_from(["agentusage", "--claude", "--codex"]).is_err());
+        assert!(Cli::try_parse_from(["agentusage", "--claude", "--gemini"]).is_err());
+        assert!(Cli::try_parse_from(["agentusage", "--codex", "--gemini"]).is_err());
+        assert!(Cli::try_parse_from(["agentusage", "--claude", "--codex", "--gemini"]).is_err());
     }
 
     #[test]
@@ -1092,10 +1095,7 @@ fn main() {
     // Set up Ctrl+C handler
     ctrlc::set_handler(|| {
         tmux::SHUTDOWN.store(true, Ordering::SeqCst);
-        // Best-effort: kill the entire agentusage tmux server
-        let _ = Command::new("tmux")
-            .args(["-L", "agentusage", "kill-server"])
-            .status();
+        tmux::kill_registered_sessions();
         std::process::exit(130);
     })
     .expect("Failed to set Ctrl+C handler");

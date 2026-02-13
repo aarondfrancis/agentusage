@@ -1,14 +1,29 @@
 use anyhow::{bail, Context, Result};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 /// Global shutdown flag, set by Ctrl+C handler.
 pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// Registry of active session names for targeted cleanup on Ctrl+C.
+static SESSIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 /// Dedicated tmux socket name to isolate from user's tmux server.
 const SOCKET_NAME: &str = "agentusage";
+
+/// Kill all sessions in the registry. Called from the Ctrl+C handler.
+pub fn kill_registered_sessions() {
+    if let Ok(sessions) = SESSIONS.lock() {
+        for name in sessions.iter() {
+            let _ = Command::new("tmux")
+                .args(["-L", SOCKET_NAME, "kill-session", "-t", name])
+                .status();
+        }
+    }
+}
 
 pub struct TmuxSession {
     pub name: String,
@@ -41,6 +56,11 @@ impl TmuxSession {
 
         if !status.success() {
             bail!("tmux new-session failed");
+        }
+
+        // Register session for Ctrl+C cleanup
+        if let Ok(mut sessions) = SESSIONS.lock() {
+            sessions.push(name.clone());
         }
 
         Ok(Self { name })
@@ -205,6 +225,11 @@ impl TmuxSession {
 
 impl Drop for TmuxSession {
     fn drop(&mut self) {
+        // Unregister session from Ctrl+C cleanup
+        if let Ok(mut sessions) = SESSIONS.lock() {
+            sessions.retain(|s| s != &self.name);
+        }
+
         match Command::new("tmux")
             .args(["-L", SOCKET_NAME, "kill-session", "-t", &self.name])
             .status()

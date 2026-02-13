@@ -15,4 +15,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--cleanup` flag to kill stale tmux sessions
 - JSON warnings as provider-keyed object (clean stdout in `--json` mode)
 - `#![deny(warnings)]` for compile-time static analysis
-- 96 unit tests
+- 116 unit tests
