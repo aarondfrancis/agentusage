@@ -1,5 +1,25 @@
 use serde::Serialize;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ApprovalPolicy {
+    /// Fail with an error when a dialog is detected
+    Fail,
+    /// Automatically accept/dismiss dialogs
+    Accept,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DialogKind {
+    TrustFolder,
+    UpdatePrompt,
+    AuthRequired,
+    TermsAcceptance,
+    FirstRunSetup,
+    SandboxTrust,
+    #[allow(dead_code)]
+    Unknown(String),
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum PercentKind {

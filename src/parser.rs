@@ -47,7 +47,12 @@ pub fn parse_claude_output(text: &str) -> Result<UsageData> {
 
                 if percent.is_none() {
                     if let Some(caps) = pct_re.captures(line) {
-                        percent = Some(caps[1].parse::<f64>().unwrap_or(0.0));
+                        match caps[1].parse::<f64>() {
+                            Ok(v) => percent = Some(v),
+                            Err(e) => {
+                                eprintln!("Warning: skipping unparseable percentage '{}': {}", &caps[1], e);
+                            }
+                        }
                     }
                 }
 
@@ -128,7 +133,13 @@ pub fn parse_codex_output(text: &str) -> Result<UsageData> {
                 Some(section) => format!("{} {} limit", section, raw_label),
                 None => format!("{} limit", raw_label),
             };
-            let percent = caps[2].parse::<f64>().unwrap_or(0.0);
+            let percent = match caps[2].parse::<f64>() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Warning: skipping unparseable Codex percentage '{}': {}", &caps[2], e);
+                    continue;
+                }
+            };
             let percent_kind = if &caps[3] == "left" {
                 PercentKind::Left
             } else {
@@ -194,7 +205,13 @@ pub fn parse_gemini_output(text: &str) -> Result<UsageData> {
             } else {
                 Some(requests_raw)
             };
-            let percent = caps[3].parse::<f64>().unwrap_or(0.0);
+            let percent = match caps[3].parse::<f64>() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Warning: skipping unparseable Gemini percentage '{}': {}", &caps[3], e);
+                    continue;
+                }
+            };
             let reset_info = format!("Resets in {}", &caps[4]);
 
             entries.push(UsageEntry {
@@ -671,5 +688,54 @@ Model-B limit:
         let json = serde_json::to_string(&data).unwrap();
         assert!(!json.contains("requests"));
         assert!(!json.contains("spent"));
+    }
+
+    // ── Parse-error-skip tests ──────────────────────────────────────
+
+    #[test]
+    fn test_claude_skips_unparseable_percentage() {
+        // Verify that a header without a valid percentage in its scan window is skipped,
+        // while a subsequent valid entry is still parsed.
+        // The parser scans 5 lines ahead, so we put enough padding between sections.
+        let text = "\
+Current session
+no percentage here
+line 2
+line 3
+line 4
+line 5
+line 6
+
+Current week (all models)
+░░░░  5% used
+Resets Feb 20
+";
+        let data = parse_claude_output(text).unwrap();
+        assert_eq!(data.entries.len(), 1);
+        assert_eq!(data.entries[0].label, "Current week (all models)");
+    }
+
+    #[test]
+    fn test_codex_skips_entry_on_bad_data() {
+        // A valid line followed by another valid line — both should parse
+        let text = "\
+5h limit:  [████] 50% left (resets 11:00)
+Weekly limit:  [████] 80% left (resets 12:00 on 20 Feb)
+";
+        let data = parse_codex_output(text).unwrap();
+        assert_eq!(data.entries.len(), 2);
+    }
+
+    #[test]
+    fn test_gemini_skips_entry_on_bad_data() {
+        // Verify valid entries still parse when mixed with non-matching lines
+        let text = "\
+│  Not a model line at all
+│  gemini-2.5-flash   6   99.3% (Resets in 4h 49m)
+│  random garbage line
+│  gemini-2.5-pro     -   98.1% (Resets in 2h 35m)
+";
+        let data = parse_gemini_output(text).unwrap();
+        assert_eq!(data.entries.len(), 2);
     }
 }
