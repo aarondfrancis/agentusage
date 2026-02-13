@@ -9,7 +9,19 @@ use crate::types::{PercentKind, UsageData, UsageEntry};
 pub fn parse_claude_output(text: &str) -> Result<UsageData> {
     let pct_re = Regex::new(r"(\d+(?:\.\d+)?)\s*%\s*used")?;
     let money_re = Regex::new(r"(\$[\d.,]+\s*/\s*\$[\d.,]+\s*spent)")?;
-    let reset_re = Regex::new(r"(Resets?\s+.+)")?;
+    let reset_re = Regex::new(r"((?:Resets?|Reses)\s*.+)")?;
+
+    fn normalize_reset_text(raw: &str) -> String {
+        let trimmed = raw.trim();
+        let mut chars = trimmed.chars();
+        let prefix: String = chars.by_ref().take(5).collect();
+        if prefix.eq_ignore_ascii_case("reses") {
+            let rest: String = chars.collect();
+            format!("Resets{}", rest)
+        } else {
+            trimmed.to_string()
+        }
+    }
 
     let known_headers = [
         "Current session",
@@ -63,7 +75,7 @@ pub fn parse_claude_output(text: &str) -> Result<UsageData> {
 
                 if reset_info.is_empty() {
                     if let Some(caps) = reset_re.captures(line) {
-                        reset_info = caps[1].to_string();
+                        reset_info = normalize_reset_text(&caps[1]);
                     }
                 }
 
@@ -91,6 +103,43 @@ pub fn parse_claude_output(text: &str) -> Result<UsageData> {
         }
 
         i += 1;
+    }
+
+    // Fallback for noisy PTY captures where section labels can be partially overwritten.
+    // In that case, recover by ordering percentages as session/week/sonnet/extra.
+    if entries.is_empty() {
+        let labels = [
+            "Current session",
+            "Current week (all models)",
+            "Current week (Sonnet only)",
+            "Extra usage",
+        ];
+        let percents: Vec<f64> = pct_re
+            .captures_iter(text)
+            .filter_map(|caps| caps[1].parse::<f64>().ok())
+            .collect();
+        let resets: Vec<String> = reset_re
+            .captures_iter(text)
+            .map(|caps| normalize_reset_text(&caps[1]))
+            .collect();
+        let spent = money_re
+            .captures(text)
+            .map(|caps| caps[1].trim().to_string());
+
+        for (idx, pct) in percents.into_iter().take(labels.len()).enumerate() {
+            let used = (pct.round() as u32).min(100);
+            let reset_info = resets.get(idx).cloned().unwrap_or_default();
+            entries.push(UsageEntry {
+                label: labels[idx].to_string(),
+                percent_used: used,
+                percent_remaining: 100 - used,
+                percent_kind: PercentKind::Used,
+                reset_minutes: parse_reset_minutes(&reset_info, "claude"),
+                reset_info,
+                spent: if idx == 3 { spent.clone() } else { None },
+                requests: None,
+            });
+        }
     }
 
     Ok(UsageData {
@@ -596,6 +645,29 @@ Resets Feb 20 at 9am (America/Chicago)
         assert_eq!(data.entries.len(), 1);
         assert_eq!(data.entries[0].percent_used, 10);
         assert!(data.entries[0].reset_info.contains("Resets 5pm"));
+    }
+
+    #[test]
+    fn test_claude_noisy_tui_fallback_ordered_percents() {
+        let text = r#"
+Settings:StatusConfigUsage
+Loadingusagedata…
+Curretsession    ██████████████28%usedResets7pm(America/Chicago)
+Currentweek(allmodels)████████16%usedResetsFeb20at9am(America/Chicago)
+Currentweek(Sonnetonly)0%usedResetsFeb15at11am(America/Chicago)
+Extrausage███████▊15%used
+$77.33/$500.00spent·ResetsMar1(America/Chicago)
+"#;
+        let data = parse_claude_output(text).unwrap();
+        assert_eq!(data.entries.len(), 4);
+        assert_eq!(data.entries[0].label, "Current session");
+        assert_eq!(data.entries[0].percent_used, 28);
+        assert_eq!(data.entries[1].label, "Current week (all models)");
+        assert_eq!(data.entries[1].percent_used, 16);
+        assert_eq!(data.entries[2].label, "Current week (Sonnet only)");
+        assert_eq!(data.entries[2].percent_used, 0);
+        assert_eq!(data.entries[3].label, "Extra usage");
+        assert_eq!(data.entries[3].percent_used, 15);
     }
 
     #[test]

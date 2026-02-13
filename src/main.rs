@@ -4,7 +4,6 @@ use anyhow::Result;
 use clap::Parser;
 use std::collections::BTreeMap;
 use std::process::Command;
-use std::sync::atomic::Ordering;
 
 use agentusage::{
     run_all, run_claude, run_codex, run_gemini, AllResults, ApprovalPolicy, PercentKind,
@@ -17,7 +16,8 @@ use agentusage::{
     version,
     about = "Check Claude Code, Codex, and Gemini CLI usage limits",
     long_about = "Check Claude Code, Codex, and Gemini CLI usage limits.\n\n\
-        Launches each CLI tool in a tmux session, runs its usage/limits command,\n\
+        Launches each CLI tool in an isolated pseudo-terminal (openpty), then\n\
+        runs its usage/status command,\n\
         parses the output, and reports usage percentages, reset times, and spend.\n\n\
         By default, checks all installed providers. Use --claude, --codex, or\n\
         --gemini to check a single provider.",
@@ -29,12 +29,12 @@ Examples:
   agentusage --claude --json  Single provider, JSON output
   agentusage --timeout 60     Wait up to 60s for data
   agentusage -C ~/project     Run CLI sessions in ~/project
-  agentusage --cleanup        Kill stale tmux sessions and exit
+  agentusage --cleanup        Kill tracked PTY child sessions and exit
 
 Exit codes:
   0  Success
   1  General error
-  2  Required tool not found (tmux or provider CLI)
+  2  Required tool not found (provider CLI)
   3  Timeout waiting for provider output
   4  Failed to parse provider output"
 )]
@@ -71,11 +71,11 @@ struct Cli {
     #[arg(long, short = 'C')]
     directory: Option<String>,
 
-    /// Kill all stale agentusage tmux sessions and exit
+    /// Kill tracked agentusage PTY child sessions and exit
     #[arg(long)]
     cleanup: bool,
 
-    /// Check if tmux and provider CLIs are installed
+    /// Check if provider CLIs are installed
     #[arg(long)]
     doctor: bool,
 }
@@ -93,24 +93,6 @@ impl Cli {
 
 fn run_doctor() {
     let mut all_ok = true;
-
-    // Check tmux
-    match Command::new("tmux").arg("-V").output() {
-        Ok(output) if output.status.success() => {
-            let version = String::from_utf8_lossy(&output.stdout);
-            println!("  tmux: {}", version.trim());
-        }
-        Ok(_) => {
-            println!("  tmux: installed (unknown version)");
-        }
-        Err(_) => {
-            println!("  tmux: not found");
-            println!(
-                "         Install with: brew install tmux (macOS) or apt install tmux (Linux)"
-            );
-            all_ok = false;
-        }
-    }
 
     // Check providers
     for (cmd, name) in [
@@ -134,9 +116,9 @@ fn run_doctor() {
     }
 
     if all_ok {
-        println!("\nAll dependencies found.");
+        println!("\nAll required provider dependencies found.");
     } else {
-        println!("\nSome dependencies are missing.");
+        println!("\nSome required provider dependencies are missing.");
         std::process::exit(1);
     }
 }
@@ -281,7 +263,7 @@ fn main() {
 
     // Handle --cleanup
     if cli.cleanup {
-        agentusage::tmux::TmuxSession::kill_all_stale_sessions();
+        agentusage::session::Session::kill_all_stale_sessions();
         return;
     }
 
@@ -291,10 +273,12 @@ fn main() {
         return;
     }
 
+    agentusage::pty::clear_shutdown();
+
     // Set up Ctrl+C handler
     ctrlc::set_handler(|| {
-        agentusage::tmux::SHUTDOWN.store(true, Ordering::SeqCst);
-        agentusage::tmux::kill_registered_sessions();
+        agentusage::pty::request_shutdown();
+        agentusage::session::Session::kill_registered_sessions();
         std::process::exit(130);
     })
     .expect("Failed to set Ctrl+C handler");

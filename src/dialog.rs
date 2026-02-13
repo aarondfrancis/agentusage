@@ -1,4 +1,4 @@
-use crate::tmux::TmuxSession;
+use crate::session::Session;
 use crate::types::DialogKind;
 use anyhow::Result;
 use std::thread;
@@ -25,10 +25,15 @@ pub fn detect_claude_dialog(content: &str) -> Option<DialogKind> {
 pub fn detect_codex_dialog(content: &str) -> Option<DialogKind> {
     let lower = content.to_lowercase();
 
+    if lower.contains("update available") && lower.contains("codex") {
+        return Some(DialogKind::UpdatePrompt);
+    }
     if lower.contains("terms") && lower.contains("accept") {
         return Some(DialogKind::TermsAcceptance);
     }
-    if lower.contains("do you trust the contents") || (lower.contains("trust") && lower.contains("directory")) {
+    if lower.contains("do you trust the contents")
+        || (lower.contains("trust") && lower.contains("directory"))
+    {
         return Some(DialogKind::TrustFolder);
     }
     if lower.contains("sandbox") && lower.contains("trust") {
@@ -99,7 +104,7 @@ pub fn dialog_error_message(kind: &DialogKind, provider: &str) -> String {
 /// Attempt to dismiss a dialog by sending Enter.
 /// Returns Ok(true) if the dialog is dismissible (Enter sent),
 /// Ok(false) if it requires manual intervention (auth, first-run).
-pub fn dismiss_dialog(kind: &DialogKind, session: &TmuxSession) -> Result<bool> {
+pub fn dismiss_dialog(kind: &DialogKind, session: &mut Session) -> Result<bool> {
     match kind {
         DialogKind::AuthRequired | DialogKind::FirstRunSetup => Ok(false),
         _ => {
@@ -119,19 +124,28 @@ mod tests {
     #[test]
     fn test_detect_claude_update() {
         let content = "A new version is available. Update available: v2.0.0";
-        assert_eq!(detect_claude_dialog(content), Some(DialogKind::UpdatePrompt));
+        assert_eq!(
+            detect_claude_dialog(content),
+            Some(DialogKind::UpdatePrompt)
+        );
     }
 
     #[test]
     fn test_detect_claude_auth() {
         let content = "Please sign in to continue using Claude Code.";
-        assert_eq!(detect_claude_dialog(content), Some(DialogKind::AuthRequired));
+        assert_eq!(
+            detect_claude_dialog(content),
+            Some(DialogKind::AuthRequired)
+        );
     }
 
     #[test]
     fn test_detect_claude_first_run() {
         let content = "Welcome to Claude Code! Let's get you set up.";
-        assert_eq!(detect_claude_dialog(content), Some(DialogKind::FirstRunSetup));
+        assert_eq!(
+            detect_claude_dialog(content),
+            Some(DialogKind::FirstRunSetup)
+        );
     }
 
     #[test]
@@ -145,7 +159,16 @@ mod tests {
     #[test]
     fn test_detect_codex_terms() {
         let content = "Please review and accept the Terms of Service.";
-        assert_eq!(detect_codex_dialog(content), Some(DialogKind::TermsAcceptance));
+        assert_eq!(
+            detect_codex_dialog(content),
+            Some(DialogKind::TermsAcceptance)
+        );
+    }
+
+    #[test]
+    fn test_detect_codex_update() {
+        let content = "Update available! Run bun install -g @openai/codex";
+        assert_eq!(detect_codex_dialog(content), Some(DialogKind::UpdatePrompt));
     }
 
     #[test]
@@ -189,7 +212,10 @@ mod tests {
     #[test]
     fn test_detect_gemini_auth() {
         let content = "Please sign in with your Google account.";
-        assert_eq!(detect_gemini_dialog(content), Some(DialogKind::AuthRequired));
+        assert_eq!(
+            detect_gemini_dialog(content),
+            Some(DialogKind::AuthRequired)
+        );
     }
 
     #[test]
@@ -203,25 +229,37 @@ mod tests {
     #[test]
     fn test_detect_claude_new_version_variant() {
         let content = "A new version of Claude Code is available!";
-        assert_eq!(detect_claude_dialog(content), Some(DialogKind::UpdatePrompt));
+        assert_eq!(
+            detect_claude_dialog(content),
+            Some(DialogKind::UpdatePrompt)
+        );
     }
 
     #[test]
     fn test_detect_claude_log_in_variant() {
         let content = "Please log in to continue.";
-        assert_eq!(detect_claude_dialog(content), Some(DialogKind::AuthRequired));
+        assert_eq!(
+            detect_claude_dialog(content),
+            Some(DialogKind::AuthRequired)
+        );
     }
 
     #[test]
     fn test_detect_claude_authenticate_variant() {
         let content = "You must authenticate before using Claude.";
-        assert_eq!(detect_claude_dialog(content), Some(DialogKind::AuthRequired));
+        assert_eq!(
+            detect_claude_dialog(content),
+            Some(DialogKind::AuthRequired)
+        );
     }
 
     #[test]
     fn test_detect_claude_first_time_variant() {
         let content = "It looks like this is your first time here.";
-        assert_eq!(detect_claude_dialog(content), Some(DialogKind::FirstRunSetup));
+        assert_eq!(
+            detect_claude_dialog(content),
+            Some(DialogKind::FirstRunSetup)
+        );
     }
 
     #[test]
@@ -233,7 +271,10 @@ mod tests {
     #[test]
     fn test_detect_gemini_log_in_variant() {
         let content = "You need to log in with your Google credentials.";
-        assert_eq!(detect_gemini_dialog(content), Some(DialogKind::AuthRequired));
+        assert_eq!(
+            detect_gemini_dialog(content),
+            Some(DialogKind::AuthRequired)
+        );
     }
 
     // ── Case insensitivity ──────────────────────────────────────────
@@ -272,14 +313,20 @@ mod tests {
     fn test_detect_claude_update_before_auth() {
         // Content has both "update available" and "sign in" — update should win
         let content = "Update available. Please sign in to update.";
-        assert_eq!(detect_claude_dialog(content), Some(DialogKind::UpdatePrompt));
+        assert_eq!(
+            detect_claude_dialog(content),
+            Some(DialogKind::UpdatePrompt)
+        );
     }
 
     #[test]
     fn test_detect_codex_terms_before_auth() {
         // Content has both terms+accept and sign in — terms should win
         let content = "Please accept the terms. Sign in required.";
-        assert_eq!(detect_codex_dialog(content), Some(DialogKind::TermsAcceptance));
+        assert_eq!(
+            detect_codex_dialog(content),
+            Some(DialogKind::TermsAcceptance)
+        );
     }
 
     // ── dialog_error_message ────────────────────────────────────────
@@ -342,12 +389,30 @@ mod tests {
     #[test]
     fn test_non_dismissible_kinds() {
         // Verify which dialog kinds are non-dismissible (without needing a real session)
-        assert!(matches!(DialogKind::AuthRequired, DialogKind::AuthRequired | DialogKind::FirstRunSetup));
-        assert!(matches!(DialogKind::FirstRunSetup, DialogKind::AuthRequired | DialogKind::FirstRunSetup));
+        assert!(matches!(
+            DialogKind::AuthRequired,
+            DialogKind::AuthRequired | DialogKind::FirstRunSetup
+        ));
+        assert!(matches!(
+            DialogKind::FirstRunSetup,
+            DialogKind::AuthRequired | DialogKind::FirstRunSetup
+        ));
         // All others should be dismissible
-        assert!(!matches!(DialogKind::TrustFolder, DialogKind::AuthRequired | DialogKind::FirstRunSetup));
-        assert!(!matches!(DialogKind::UpdatePrompt, DialogKind::AuthRequired | DialogKind::FirstRunSetup));
-        assert!(!matches!(DialogKind::TermsAcceptance, DialogKind::AuthRequired | DialogKind::FirstRunSetup));
-        assert!(!matches!(DialogKind::SandboxTrust, DialogKind::AuthRequired | DialogKind::FirstRunSetup));
+        assert!(!matches!(
+            DialogKind::TrustFolder,
+            DialogKind::AuthRequired | DialogKind::FirstRunSetup
+        ));
+        assert!(!matches!(
+            DialogKind::UpdatePrompt,
+            DialogKind::AuthRequired | DialogKind::FirstRunSetup
+        ));
+        assert!(!matches!(
+            DialogKind::TermsAcceptance,
+            DialogKind::AuthRequired | DialogKind::FirstRunSetup
+        ));
+        assert!(!matches!(
+            DialogKind::SandboxTrust,
+            DialogKind::AuthRequired | DialogKind::FirstRunSetup
+        ));
     }
 }

@@ -2,7 +2,8 @@
 
 pub mod dialog;
 pub mod parser;
-pub mod tmux;
+pub mod pty;
+pub mod session;
 pub mod types;
 
 use anyhow::{bail, Context, Result};
@@ -15,7 +16,7 @@ use dialog::{
     dismiss_dialog,
 };
 use parser::{parse_claude_output, parse_codex_output, parse_gemini_output};
-use tmux::TmuxSession;
+use session::{Session, SessionLaunch};
 use types::DialogKind;
 
 pub use types::{ApprovalPolicy, PercentKind, UsageData, UsageEntry};
@@ -55,7 +56,7 @@ pub fn check_command_exists(cmd: &str) -> Result<()> {
 /// Returns Ok(true) if a dialog was found and dismissed (caller should retry wait),
 /// Ok(false) if no dialog found, or Err if dialog found and policy is Fail / not dismissible.
 fn handle_dialog_check<F>(
-    session: &TmuxSession,
+    session: &mut Session,
     detect_fn: F,
     provider: &str,
     policy: ApprovalPolicy,
@@ -99,21 +100,46 @@ fn pick_richer(a: UsageData, b: UsageData) -> UsageData {
     }
 }
 
+fn looks_like_codex_update_prompt(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    lower.contains("update available") && lower.contains("codex")
+}
+
+fn content_tail(content: &str, max_chars: usize) -> String {
+    let mut chars: Vec<char> = content.chars().rev().take(max_chars).collect();
+    chars.reverse();
+    chars.into_iter().collect()
+}
+
+fn normalized_no_whitespace_lower(content: &str) -> String {
+    content
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
 pub fn run_claude(config: &UsageConfig) -> Result<UsageData> {
     check_command_exists("claude")?;
 
-    let session = TmuxSession::new(config.directory.as_deref())?;
+    let mut session = Session::new(
+        config.directory.as_deref(),
+        config.verbose,
+        SessionLaunch {
+            binary: "claude",
+            args: &["--allowed-tools", ""],
+        },
+    )?;
     let poll_interval = Duration::from_millis(500);
     let prompt_timeout = Duration::from_secs(30);
     let data_timeout = Duration::from_secs(config.timeout);
 
     if config.verbose {
-        eprintln!("[verbose] Created tmux session: {}", session.name);
+        eprintln!(
+            "[verbose] Created {} session for claude",
+            session.backend_name()
+        );
     }
-
-    // Launch claude CLI
-    session.send_keys_literal("claude")?;
-    session.send_keys("Enter")?;
 
     if config.verbose {
         eprintln!("[verbose] Launched claude, waiting for prompt...");
@@ -133,7 +159,7 @@ pub fn run_claude(config: &UsageConfig) -> Result<UsageData> {
     if let Err(e) = prompt_result {
         // Check for dialogs before giving up
         if handle_dialog_check(
-            &session,
+            &mut session,
             detect_claude_dialog,
             "claude",
             config.approval_policy,
@@ -169,66 +195,118 @@ pub fn run_claude(config: &UsageConfig) -> Result<UsageData> {
         eprintln!("[verbose] Prompt detected. Current pane:\n{}", content);
     }
 
-    // Type /status — triggers autocomplete, then Enter to select and execute
-    session.send_keys_literal("/status")?;
-    std::thread::sleep(Duration::from_millis(800));
-
-    if config.verbose {
-        let content = session.capture_pane()?;
-        eprintln!("[verbose] After typing /status:\n{}", content);
-    }
-
+    // Claude's newer UI is most stable via `/usage`; `/status` now opens a tabbed screen
+    // where `Config` may be selected first.
+    session.send_keys("Esc")?;
+    std::thread::sleep(Duration::from_millis(120));
+    session.send_keys_literal("/usage")?;
+    std::thread::sleep(Duration::from_millis(250));
     session.send_keys("Enter")?;
 
     if config.verbose {
-        eprintln!("[verbose] Sent Enter, waiting for status screen...");
+        eprintln!("[verbose] Sent /usage + Enter, waiting for usage data...");
     }
 
-    // Wait for the actual status screen (not the autocomplete dropdown)
-    session
-        .wait_for(
-            |content| {
-                let has_tabs = content.contains("Config") || content.contains("Usage");
-                let is_autocomplete = content.contains("/statusline") || content.contains("/stats");
-                has_tabs && !is_autocomplete
-            },
-            Duration::from_secs(15),
-            poll_interval,
-            false,
-            config.verbose,
-        )
-        .context("[timeout] Timed out waiting for status screen")?;
+    let pct_re = regex::Regex::new(r"\d+(?:\.\d+)?%\s*used")?;
+    let usage_start = std::time::Instant::now();
+    let mut last_enter = usage_start
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or(usage_start);
+    let mut content = String::new();
+    let mut usage_ready = false;
 
-    std::thread::sleep(Duration::from_millis(500));
+    while usage_start.elapsed() < data_timeout {
+        content = session.capture_pane()?;
+        let normalized = normalized_no_whitespace_lower(&content);
 
-    // Navigate to Usage tab using Tab key
-    for i in 0..5 {
-        session.send_keys("Tab")?;
-        std::thread::sleep(Duration::from_millis(300));
-
-        let content = session.capture_pane()?;
-        if content.contains("% used") || content.contains("Resets") {
-            if config.verbose {
-                eprintln!("[verbose] Reached Usage tab after {} Tab presses", i + 1);
-            }
+        if pct_re.is_match(&content) {
+            usage_ready = true;
             break;
         }
-    }
 
-    if config.verbose {
-        eprintln!("[verbose] Navigated tabs, waiting for usage data...");
-    }
-
-    let pct_re = regex::Regex::new(r"\d+%\s*used")?;
-    let content = session
-        .wait_for(
-            |content| pct_re.is_match(content),
-            data_timeout,
-            poll_interval,
-            false,
+        // If Claude opened a prompt/menu (update/auth/etc), handle it and keep going.
+        if handle_dialog_check(
+            &mut session,
+            detect_claude_dialog,
+            "claude",
+            config.approval_policy,
             config.verbose,
-        )
-        .context("[timeout] Timed out waiting for usage data. Check your internet connection.")?;
+        )? {
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+
+        // Command palette hint rows sometimes require one more Enter to execute `/usage`.
+        if normalized.contains("showplanusagelimits")
+            || normalized.contains("showplan")
+            || normalized.contains("/usage")
+        {
+            session.send_keys("Enter")?;
+            last_enter = std::time::Instant::now();
+            std::thread::sleep(Duration::from_millis(180));
+            continue;
+        }
+
+        // Nudge the TUI occasionally while waiting for usage panels to render.
+        if !pct_re.is_match(&content) && last_enter.elapsed() >= Duration::from_millis(850) {
+            session.send_keys("Enter")?;
+            last_enter = std::time::Instant::now();
+        }
+
+        std::thread::sleep(poll_interval);
+    }
+
+    if !usage_ready {
+        if config.verbose {
+            eprintln!(
+                "[verbose] /usage did not render in time; falling back to /status usage tab navigation"
+            );
+        }
+        session.send_keys("Esc")?;
+        std::thread::sleep(Duration::from_millis(120));
+        session.send_keys_literal("/status")?;
+        std::thread::sleep(Duration::from_millis(300));
+        session.send_keys("Enter")?;
+
+        // Wait for the status screen tab bar and then move right toward Usage.
+        session
+            .wait_for(
+                |content| {
+                    let tail = content_tail(content, 4000);
+                    tail.contains("Status") && tail.contains("Config") && tail.contains("Usage")
+                },
+                Duration::from_secs(15),
+                poll_interval,
+                false,
+                config.verbose,
+            )
+            .context("[timeout] Timed out waiting for status screen")?;
+
+        for _ in 0..4 {
+            let screen = session.capture_pane()?;
+            if pct_re.is_match(&screen) {
+                content = screen;
+                usage_ready = true;
+                break;
+            }
+            session.send_keys("Right")?;
+            std::thread::sleep(Duration::from_millis(250));
+        }
+
+        if !usage_ready {
+            content = session
+                .wait_for(
+                    |screen| pct_re.is_match(screen),
+                    data_timeout,
+                    poll_interval,
+                    false,
+                    config.verbose,
+                )
+                .context(
+                    "[timeout] Timed out waiting for usage data. Check your internet connection.",
+                )?;
+        }
+    }
 
     // Wait for TUI to stabilize instead of fixed sleep
     let _ = session.wait_for_stable(Duration::from_secs(2), poll_interval, config.verbose);
@@ -253,18 +331,24 @@ pub fn run_claude(config: &UsageConfig) -> Result<UsageData> {
 pub fn run_codex(config: &UsageConfig) -> Result<UsageData> {
     check_command_exists("codex")?;
 
-    let session = TmuxSession::new(config.directory.as_deref())?;
+    let mut session = Session::new(
+        config.directory.as_deref(),
+        config.verbose,
+        SessionLaunch {
+            binary: "codex",
+            args: &["-s", "read-only", "-a", "untrusted"],
+        },
+    )?;
     let poll_interval = Duration::from_millis(500);
     let prompt_timeout = Duration::from_secs(30);
     let data_timeout = Duration::from_secs(config.timeout);
 
     if config.verbose {
-        eprintln!("[verbose] Created tmux session: {}", session.name);
+        eprintln!(
+            "[verbose] Created {} session for codex",
+            session.backend_name()
+        );
     }
-
-    // Launch codex CLI
-    session.send_keys_literal("codex")?;
-    session.send_keys("Enter")?;
 
     if config.verbose {
         eprintln!("[verbose] Launched codex, waiting for prompt...");
@@ -283,7 +367,7 @@ pub fn run_codex(config: &UsageConfig) -> Result<UsageData> {
     if let Err(e) = prompt_result {
         // Check for dialogs before giving up
         if handle_dialog_check(
-            &session,
+            &mut session,
             detect_codex_dialog,
             "codex",
             config.approval_policy,
@@ -324,16 +408,45 @@ pub fn run_codex(config: &UsageConfig) -> Result<UsageData> {
     }
 
     // Wait for limit data to appear
-    let limit_re = regex::Regex::new(r"\d+%\s*left")?;
-    let content = session
+    let limit_re = regex::Regex::new(r"\d+%\s*(left|used)")?;
+    let mut content = session
         .wait_for(
-            |content| limit_re.is_match(content),
+            |content| limit_re.is_match(content) || looks_like_codex_update_prompt(content),
             data_timeout,
             poll_interval,
             false,
             config.verbose,
         )
         .context("[timeout] Timed out waiting for Codex usage data.")?;
+
+    if looks_like_codex_update_prompt(&content) && !limit_re.is_match(&content) {
+        if config.verbose {
+            eprintln!(
+                "[verbose] Codex update prompt detected, selecting Skip and retrying /status"
+            );
+        }
+        session.send_keys("Down")?;
+        std::thread::sleep(Duration::from_millis(120));
+        session.send_keys("Enter")?;
+        std::thread::sleep(Duration::from_millis(150));
+        session.send_keys("Enter")?;
+        std::thread::sleep(Duration::from_millis(200));
+        session.send_keys_literal("/status")?;
+        std::thread::sleep(Duration::from_millis(200));
+        session.send_keys("Enter")?;
+
+        content = session
+            .wait_for(
+                |content| limit_re.is_match(content),
+                data_timeout,
+                poll_interval,
+                false,
+                config.verbose,
+            )
+            .context(
+                "[timeout] Timed out waiting for Codex usage data after dismissing update prompt.",
+            )?;
+    }
 
     // Wait for all data to render
     let _ = session.wait_for_stable(Duration::from_secs(2), poll_interval, config.verbose);
@@ -358,18 +471,24 @@ pub fn run_codex(config: &UsageConfig) -> Result<UsageData> {
 pub fn run_gemini(config: &UsageConfig) -> Result<UsageData> {
     check_command_exists("gemini")?;
 
-    let session = TmuxSession::new(config.directory.as_deref())?;
+    let mut session = Session::new(
+        config.directory.as_deref(),
+        config.verbose,
+        SessionLaunch {
+            binary: "gemini",
+            args: &[],
+        },
+    )?;
     let poll_interval = Duration::from_millis(500);
     let prompt_timeout = Duration::from_secs(30);
     let data_timeout = Duration::from_secs(config.timeout);
 
     if config.verbose {
-        eprintln!("[verbose] Created tmux session: {}", session.name);
+        eprintln!(
+            "[verbose] Created {} session for gemini",
+            session.backend_name()
+        );
     }
-
-    // Launch gemini CLI
-    session.send_keys_literal("gemini")?;
-    session.send_keys("Enter")?;
 
     if config.verbose {
         eprintln!("[verbose] Launched gemini, waiting for prompt...");
@@ -393,7 +512,7 @@ pub fn run_gemini(config: &UsageConfig) -> Result<UsageData> {
     if let Err(e) = prompt_result {
         // Check for dialogs before giving up
         if handle_dialog_check(
-            &session,
+            &mut session,
             detect_gemini_dialog,
             "gemini",
             config.approval_policy,
@@ -433,7 +552,7 @@ pub fn run_gemini(config: &UsageConfig) -> Result<UsageData> {
                     bail!("[timeout] {}", dialog_error_message(&kind, "gemini"));
                 }
                 ApprovalPolicy::Accept => {
-                    let dismissed = dismiss_dialog(&kind, &session)?;
+                    let dismissed = dismiss_dialog(&kind, &mut session)?;
                     if !dismissed {
                         bail!("[timeout] {}", dialog_error_message(&kind, "gemini"));
                     }
