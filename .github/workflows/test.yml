@@ -6,8 +6,69 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: write
+
 jobs:
+  lint:
+    outputs:
+      fixed_sha: ${{ steps.output_sha.outputs.sha }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Auto-fix formatting
+        run: cargo fmt --all
+
+      - name: Auto-fix clippy
+        run: cargo clippy --fix --all-targets --allow-dirty --allow-staged -- -D warnings
+
+      - name: Verify lint is clean
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+
+      - name: Commit auto-fixes
+        id: commit_fixes
+        if: github.event_name == 'push' && github.actor != 'github-actions[bot]'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No lint fixes to commit."
+            exit 0
+          fi
+
+          git add -A
+          git commit -m "ci: auto-fix lint"
+          git push
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Capture tested SHA
+        id: output_sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
   test:
+    needs: lint
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -17,6 +78,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.lint.outputs.fixed_sha }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -36,9 +99,3 @@ jobs:
 
       - name: Test
         run: cargo test
-
-      - name: Check formatting
-        run: rustfmt --check src/*.rs
-
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
