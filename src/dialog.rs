@@ -47,12 +47,30 @@ pub fn detect_codex_dialog(content: &str) -> Option<DialogKind> {
 }
 
 /// Detect Gemini-specific dialogs in screen content.
+/// Priority: trust > theme > update > terms > auth.
 pub fn detect_gemini_dialog(content: &str) -> Option<DialogKind> {
     let lower = content.to_lowercase();
 
+    // Priority 1: Trust folder (existing)
     if lower.contains("do you trust this folder") {
         return Some(DialogKind::TrustFolder);
     }
+    // Priority 2: Theme selection → FirstRunSetup
+    if lower.contains("select a theme")
+        || lower.contains("choose a theme")
+        || lower.contains("color theme")
+    {
+        return Some(DialogKind::FirstRunSetup);
+    }
+    // Priority 3: Update available → UpdatePrompt
+    if lower.contains("update available") || lower.contains("new version") {
+        return Some(DialogKind::UpdatePrompt);
+    }
+    // Priority 4: Terms acceptance → TermsAcceptance
+    if lower.contains("terms") && (lower.contains("accept") || lower.contains("agree")) {
+        return Some(DialogKind::TermsAcceptance);
+    }
+    // Priority 5: Auth required (last so specific checks win)
     if lower.contains("sign in") || lower.contains("log in") || lower.contains("authenticate") {
         return Some(DialogKind::AuthRequired);
     }
@@ -382,6 +400,189 @@ mod tests {
         let msg = dialog_error_message(&DialogKind::Unknown("weird popup".into()), "gemini");
         assert!(msg.contains("weird popup"));
         assert!(msg.contains("gemini"));
+    }
+
+    // ── Dismissibility (logic only) ─────────────────────────────────
+
+    // ── Gemini dialog: theme selection ──────────────────────────────
+
+    #[test]
+    fn test_detect_gemini_theme_select() {
+        assert_eq!(
+            detect_gemini_dialog("Select a theme for Gemini CLI"),
+            Some(DialogKind::FirstRunSetup)
+        );
+    }
+
+    #[test]
+    fn test_detect_gemini_theme_choose() {
+        assert_eq!(
+            detect_gemini_dialog("Choose a theme:"),
+            Some(DialogKind::FirstRunSetup)
+        );
+    }
+
+    #[test]
+    fn test_detect_gemini_theme_color() {
+        assert_eq!(
+            detect_gemini_dialog("Pick a color theme"),
+            Some(DialogKind::FirstRunSetup)
+        );
+    }
+
+    // ── Gemini dialog: update ───────────────────────────────────────
+
+    #[test]
+    fn test_detect_gemini_update_available() {
+        assert_eq!(
+            detect_gemini_dialog("Update available: v0.29.0"),
+            Some(DialogKind::UpdatePrompt)
+        );
+    }
+
+    #[test]
+    fn test_detect_gemini_new_version() {
+        assert_eq!(
+            detect_gemini_dialog("A new version is available"),
+            Some(DialogKind::UpdatePrompt)
+        );
+    }
+
+    // ── Gemini dialog: terms ────────────────────────────────────────
+
+    #[test]
+    fn test_detect_gemini_terms_accept() {
+        assert_eq!(
+            detect_gemini_dialog("Please accept the terms of service"),
+            Some(DialogKind::TermsAcceptance)
+        );
+    }
+
+    #[test]
+    fn test_detect_gemini_terms_agree() {
+        assert_eq!(
+            detect_gemini_dialog("You must agree to the terms"),
+            Some(DialogKind::TermsAcceptance)
+        );
+    }
+
+    // ── Gemini dialog: case insensitivity (new types) ───────────────
+
+    #[test]
+    fn test_detect_gemini_theme_uppercase() {
+        assert_eq!(
+            detect_gemini_dialog("SELECT A THEME"),
+            Some(DialogKind::FirstRunSetup)
+        );
+    }
+
+    #[test]
+    fn test_detect_gemini_update_uppercase() {
+        assert_eq!(
+            detect_gemini_dialog("UPDATE AVAILABLE"),
+            Some(DialogKind::UpdatePrompt)
+        );
+    }
+
+    #[test]
+    fn test_detect_gemini_terms_uppercase() {
+        assert_eq!(
+            detect_gemini_dialog("ACCEPT THE TERMS"),
+            Some(DialogKind::TermsAcceptance)
+        );
+    }
+
+    // ── Gemini dialog: priority ─────────────────────────────────────
+
+    #[test]
+    fn test_detect_gemini_trust_before_theme() {
+        assert_eq!(
+            detect_gemini_dialog("Do you trust this folder? Select a theme."),
+            Some(DialogKind::TrustFolder)
+        );
+    }
+
+    #[test]
+    fn test_detect_gemini_theme_before_update() {
+        assert_eq!(
+            detect_gemini_dialog("Select a theme. Update available."),
+            Some(DialogKind::FirstRunSetup)
+        );
+    }
+
+    #[test]
+    fn test_detect_gemini_update_before_terms() {
+        assert_eq!(
+            detect_gemini_dialog("Update available. Accept the terms."),
+            Some(DialogKind::UpdatePrompt)
+        );
+    }
+
+    #[test]
+    fn test_detect_gemini_terms_before_auth() {
+        assert_eq!(
+            detect_gemini_dialog("Accept the terms. Sign in required."),
+            Some(DialogKind::TermsAcceptance)
+        );
+    }
+
+    #[test]
+    fn test_detect_gemini_trust_before_auth() {
+        assert_eq!(
+            detect_gemini_dialog("Do you trust this folder? Sign in first."),
+            Some(DialogKind::TrustFolder)
+        );
+    }
+
+    // ── Gemini dialog: no false positives ───────────────────────────
+
+    #[test]
+    fn test_detect_gemini_no_dialog_signed_in() {
+        assert_eq!(
+            detect_gemini_dialog("Signed in as user@gmail.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_detect_gemini_no_dialog_logged_in() {
+        assert_eq!(
+            detect_gemini_dialog("Logged in as user@gmail.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_detect_gemini_no_dialog_model_info() {
+        assert_eq!(detect_gemini_dialog("Model: gemini-2.5-pro"), None);
+    }
+
+    #[test]
+    fn test_detect_gemini_no_dialog_prompt() {
+        assert_eq!(detect_gemini_dialog("gemini > hello"), None);
+    }
+
+    #[test]
+    fn test_detect_gemini_no_dialog_accept_without_terms() {
+        // "accept" alone (without "terms") should NOT trigger TermsAcceptance
+        assert_eq!(detect_gemini_dialog("Please accept the invite"), None);
+    }
+
+    #[test]
+    fn test_detect_gemini_no_dialog_what_can_i_help() {
+        // Ready indicator is not a dialog
+        assert_eq!(
+            detect_gemini_dialog("What can I help you with?"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_detect_gemini_authenticate_variant() {
+        assert_eq!(
+            detect_gemini_dialog("You must authenticate with Google."),
+            Some(DialogKind::AuthRequired)
+        );
     }
 
     // ── Dismissibility (logic only) ─────────────────────────────────

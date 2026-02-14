@@ -119,6 +119,73 @@ fn normalized_no_whitespace_lower(content: &str) -> String {
         .collect()
 }
 
+/// Check whether the Gemini CLI pane content indicates the prompt is ready.
+/// Covers both legacy patterns (v0.27 and earlier) and v0.28+ patterns.
+fn gemini_prompt_ready(content: &str) -> bool {
+    // Legacy patterns (case-sensitive originals)
+    if content.contains("GEMINI.md")
+        || content.contains("MCP servers")
+        || content.contains("gemini >")
+        || content.contains("Gemini CLI")
+        || content.contains("Do you trust this folder")
+    {
+        return true;
+    }
+
+    let lower = content.to_lowercase();
+
+    // Legacy patterns (case-insensitive variants)
+    if lower.contains("gemini.md") || lower.contains("mcp servers") {
+        return true;
+    }
+
+    // v0.28+ identity header
+    if lower.contains("signed in as")
+        || lower.contains("logged in as")
+        || lower.contains("google account")
+    {
+        return true;
+    }
+
+    // Theme / first-run dialog
+    if lower.contains("select a theme")
+        || lower.contains("choose a theme")
+        || lower.contains("color theme")
+    {
+        return true;
+    }
+
+    // Update prompts
+    if lower.contains("update available") || lower.contains("new version") {
+        return true;
+    }
+
+    // Terms dialog
+    if lower.contains("terms") && (lower.contains("accept") || lower.contains("agree")) {
+        return true;
+    }
+
+    // Model info in startup header
+    if lower.contains("model:") {
+        return true;
+    }
+
+    // Ready indicator
+    if lower.contains("what can i help") {
+        return true;
+    }
+
+    // Bare `>` at line start (strict: entire trimmed line or `> ` prefix)
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed == ">" || trimmed.starts_with("> ") {
+            return true;
+        }
+    }
+
+    false
+}
+
 pub fn run_claude(config: &UsageConfig) -> Result<UsageData> {
     check_command_exists("claude")?;
 
@@ -494,15 +561,9 @@ pub fn run_gemini(config: &UsageConfig) -> Result<UsageData> {
         eprintln!("[verbose] Launched gemini, waiting for prompt...");
     }
 
-    // Wait for Gemini prompt — match prompt OR trust dialog so we don't time out
+    // Wait for Gemini prompt — match prompt OR dialog so we don't time out
     let prompt_result = session.wait_for(
-        |content| {
-            content.contains("GEMINI.md")
-                || content.contains("MCP servers")
-                || content.contains("gemini >")
-                || content.contains("Gemini CLI")
-                || content.contains("Do you trust this folder")
-        },
+        gemini_prompt_ready,
         prompt_timeout,
         poll_interval,
         false,
@@ -521,12 +582,7 @@ pub fn run_gemini(config: &UsageConfig) -> Result<UsageData> {
             // Dialog dismissed, retry waiting for prompt
             session
                 .wait_for(
-                    |content| {
-                        content.contains("GEMINI.md")
-                            || content.contains("MCP servers")
-                            || content.contains("gemini >")
-                            || content.contains("Gemini CLI")
-                    },
+                    gemini_prompt_ready,
                     prompt_timeout,
                     poll_interval,
                     false,
@@ -536,9 +592,12 @@ pub fn run_gemini(config: &UsageConfig) -> Result<UsageData> {
                     "[timeout] Timed out waiting for Gemini prompt after dismissing dialog.",
                 )?;
         } else {
-            return Err(e.context(
-                "Timed out waiting for Gemini prompt. Is gemini authenticated? Try running 'gemini' manually."
-            ));
+            let pane = session.capture_pane().unwrap_or_default();
+            let tail = content_tail(&pane, 500);
+            return Err(e.context(format!(
+                "Timed out waiting for Gemini prompt. Is gemini authenticated? Try running 'gemini' manually.\nLast captured output:\n{}",
+                tail
+            )));
         }
     } else {
         // wait_for succeeded — check if what we matched was actually a dialog
@@ -562,12 +621,7 @@ pub fn run_gemini(config: &UsageConfig) -> Result<UsageData> {
                     // Re-wait for the actual prompt after dialog dismissal
                     session
                         .wait_for(
-                            |content| {
-                                content.contains("GEMINI.md")
-                                    || content.contains("MCP servers")
-                                    || content.contains("gemini >")
-                                    || content.contains("Gemini CLI")
-                            },
+                            gemini_prompt_ready,
                             prompt_timeout,
                             poll_interval,
                             false,
@@ -596,17 +650,45 @@ pub fn run_gemini(config: &UsageConfig) -> Result<UsageData> {
         eprintln!("[verbose] Sent /stats session + Enter, waiting for usage data...");
     }
 
-    // Wait for usage data to appear
-    let pct_re = regex::Regex::new(r"\d+(?:\.\d+)?%\s*\(Resets?")?;
-    let content = session
-        .wait_for(
-            |content| pct_re.is_match(content),
-            data_timeout,
-            poll_interval,
-            false,
+    // Wait for usage data to appear, checking for dialogs
+    let pct_re = regex::Regex::new(r"(?i)\d+(?:\.\d+)?%\s*\(Resets?\b")?;
+    let data_start = std::time::Instant::now();
+    let mut content = String::new();
+    let mut data_ready = false;
+
+    while data_start.elapsed() < data_timeout {
+        content = session.capture_pane()?;
+        if pct_re.is_match(&content) {
+            data_ready = true;
+            break;
+        }
+
+        // Check for dialogs that may have appeared during data wait
+        if handle_dialog_check(
+            &mut session,
+            detect_gemini_dialog,
+            "gemini",
+            config.approval_policy,
             config.verbose,
-        )
-        .context("[timeout] Timed out waiting for Gemini usage data.")?;
+        )? {
+            // Dialog dismissed, re-send the command
+            session.send_keys_literal("/stats session")?;
+            std::thread::sleep(Duration::from_millis(500));
+            session.send_keys("Enter")?;
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+
+        std::thread::sleep(poll_interval);
+    }
+
+    if !data_ready {
+        let tail = content_tail(&content, 500);
+        bail!(
+            "[timeout] Timed out waiting for Gemini usage data.\nLast captured output:\n{}",
+            tail
+        );
+    }
 
     // Wait for all data to render
     let _ = session.wait_for_stable(Duration::from_secs(2), poll_interval, config.verbose);
@@ -789,5 +871,236 @@ mod tests {
         assert!(result.is_err());
         let err = format!("{:#}", result.unwrap_err());
         assert!(err.contains("[tool-missing]"));
+    }
+
+    // ── gemini_prompt_ready: legacy path ────────────────────────────
+
+    #[test]
+    fn test_gemini_prompt_ready_legacy_gemini_md() {
+        assert!(gemini_prompt_ready("Loaded GEMINI.md"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_legacy_mcp_servers() {
+        assert!(gemini_prompt_ready("Found 3 MCP servers"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_legacy_gemini_prompt() {
+        assert!(gemini_prompt_ready("gemini > type here"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_legacy_gemini_cli() {
+        assert!(gemini_prompt_ready("Welcome to Gemini CLI v0.28.0"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_legacy_trust_dialog() {
+        assert!(gemini_prompt_ready("Do you trust this folder"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_legacy_full_startup() {
+        assert!(gemini_prompt_ready(
+            "Loaded GEMINI.md\nFound 3 MCP servers\ngemini >"
+        ));
+    }
+
+    // ── gemini_prompt_ready: new path ───────────────────────────────
+
+    #[test]
+    fn test_gemini_prompt_ready_bare_gt_entire_line() {
+        assert!(gemini_prompt_ready("some header\n>\nmore text"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_bare_gt_with_space() {
+        assert!(gemini_prompt_ready("header\n> \nfooter"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_gt_with_trailing_content() {
+        assert!(gemini_prompt_ready("header\n> type your message"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_no_false_positive_gt_in_text() {
+        assert!(!gemini_prompt_ready("value > 5"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_no_false_positive_arrow() {
+        assert!(!gemini_prompt_ready("use -> arrow"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_no_false_positive_comparison() {
+        assert!(!gemini_prompt_ready("5 > 3"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_signed_in() {
+        assert!(gemini_prompt_ready("Signed in as user@gmail.com"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_logged_in() {
+        assert!(gemini_prompt_ready("Logged in as user@gmail.com"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_model_indicator() {
+        assert!(gemini_prompt_ready("Model: gemini-2.5-pro"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_select_theme() {
+        assert!(gemini_prompt_ready("Select a theme"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_choose_theme() {
+        assert!(gemini_prompt_ready("Choose a theme for the CLI"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_update_available() {
+        assert!(gemini_prompt_ready("Update available: v0.29.0"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_new_version() {
+        assert!(gemini_prompt_ready("New version available"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_terms() {
+        assert!(gemini_prompt_ready(
+            "Please accept the terms of service"
+        ));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_what_can_i_help() {
+        assert!(gemini_prompt_ready("What can I help you with?"));
+    }
+
+    // ── gemini_prompt_ready: case insensitivity ─────────────────────
+
+    #[test]
+    fn test_gemini_prompt_ready_lowercase_gemini_md() {
+        assert!(gemini_prompt_ready("loaded gemini.md from disk"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_uppercase_mcp_servers() {
+        assert!(gemini_prompt_ready("Found 3 MCP SERVERS configured"));
+    }
+
+    // ── gemini_prompt_ready: negative tests ─────────────────────────
+
+    #[test]
+    fn test_gemini_prompt_ready_empty() {
+        assert!(!gemini_prompt_ready(""));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_loading() {
+        assert!(!gemini_prompt_ready("Loading..."));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_processing() {
+        assert!(!gemini_prompt_ready("Processing request..."));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_random_text() {
+        assert!(!gemini_prompt_ready(
+            "The quick brown fox jumps over the lazy dog"
+        ));
+    }
+
+    // ── gemini_prompt_ready: additional edge cases ──────────────────
+
+    #[test]
+    fn test_gemini_prompt_ready_google_account() {
+        assert!(gemini_prompt_ready("Using Google Account user@gmail.com"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_color_theme() {
+        assert!(gemini_prompt_ready("Pick a color theme for the CLI"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_no_false_positive_gt_no_space() {
+        // ">foo" without space after > should NOT match
+        assert!(!gemini_prompt_ready(">foo"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_bare_gt_only_content() {
+        assert!(gemini_prompt_ready(">"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_gt_in_multiline_no_match() {
+        // > embedded in text across multiple lines, never at line start
+        assert!(!gemini_prompt_ready("line1\nvalue > 5\nline3"));
+    }
+
+    #[test]
+    fn test_gemini_prompt_ready_what_can_i_help_uppercase() {
+        assert!(gemini_prompt_ready("WHAT CAN I HELP you with today?"));
+    }
+
+    // ── gemini_prompt_ready: data regex ─────────────────────────────
+
+    #[test]
+    fn test_gemini_data_regex_case_insensitive() {
+        let re = regex::Regex::new(r"(?i)\d+(?:\.\d+)?%\s*\(Resets?\b").unwrap();
+        assert!(re.is_match("45.2% (Resets in 3 hours)"));
+        assert!(re.is_match("45.2% (resets in 3 hours)"));
+        assert!(re.is_match("45.2% (RESETS IN 3 HOURS)"));
+        assert!(re.is_match("100% (Reset tomorrow)"));
+        assert!(re.is_match("100% (reset tomorrow)"));
+    }
+
+    #[test]
+    fn test_gemini_data_regex_no_false_positive() {
+        let re = regex::Regex::new(r"(?i)\d+(?:\.\d+)?%\s*\(Resets?\b").unwrap();
+        assert!(!re.is_match("45% (Resetting)"));
+        assert!(!re.is_match("45% used"));
+        assert!(!re.is_match("no percentage here"));
+    }
+
+    // ── content_tail ────────────────────────────────────────────────
+
+    #[test]
+    fn test_content_tail_shorter_than_max() {
+        assert_eq!(content_tail("hello", 500), "hello");
+    }
+
+    #[test]
+    fn test_content_tail_exact_max() {
+        assert_eq!(content_tail("abc", 3), "abc");
+    }
+
+    #[test]
+    fn test_content_tail_longer_than_max() {
+        assert_eq!(content_tail("hello world", 5), "world");
+    }
+
+    #[test]
+    fn test_content_tail_empty() {
+        assert_eq!(content_tail("", 500), "");
+    }
+
+    #[test]
+    fn test_content_tail_unicode() {
+        // Ensure char-based truncation doesn't split codepoints
+        assert_eq!(content_tail("héllo wörld", 5), "wörld");
     }
 }
