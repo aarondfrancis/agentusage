@@ -119,15 +119,16 @@ fn normalized_no_whitespace_lower(content: &str) -> String {
         .collect()
 }
 
-/// Check whether the Gemini CLI pane content indicates the prompt is ready.
-/// Covers both legacy patterns (v0.27 and earlier) and v0.28+ patterns.
+/// Check whether the Gemini CLI pane content indicates the prompt is
+/// actually ready for input.  Only matches patterns that appear once the
+/// CLI is interactive — startup-only text (identity headers, dialog
+/// screens, banners) is intentionally excluded and handled separately by
+/// the dialog-checking poll loop in `run_gemini`.
 fn gemini_prompt_ready(content: &str) -> bool {
     // Legacy patterns (case-sensitive originals)
     if content.contains("GEMINI.md")
         || content.contains("MCP servers")
         || content.contains("gemini >")
-        || content.contains("Gemini CLI")
-        || content.contains("Do you trust this folder")
     {
         return true;
     }
@@ -136,37 +137,6 @@ fn gemini_prompt_ready(content: &str) -> bool {
 
     // Legacy patterns (case-insensitive variants)
     if lower.contains("gemini.md") || lower.contains("mcp servers") {
-        return true;
-    }
-
-    // v0.28+ identity header
-    if lower.contains("signed in as")
-        || lower.contains("logged in as")
-        || lower.contains("google account")
-    {
-        return true;
-    }
-
-    // Theme / first-run dialog
-    if lower.contains("select a theme")
-        || lower.contains("choose a theme")
-        || lower.contains("color theme")
-    {
-        return true;
-    }
-
-    // Update prompts
-    if lower.contains("update available") || lower.contains("new version") {
-        return true;
-    }
-
-    // Terms dialog
-    if lower.contains("terms") && (lower.contains("accept") || lower.contains("agree")) {
-        return true;
-    }
-
-    // Model info in startup header
-    if lower.contains("model:") {
         return true;
     }
 
@@ -547,7 +517,13 @@ pub fn run_gemini(config: &UsageConfig) -> Result<UsageData> {
         },
     )?;
     let poll_interval = Duration::from_millis(500);
-    let prompt_timeout = Duration::from_secs(30);
+    // Gemini v0.28+ has a long auth validation phase (spinners, loading
+    // extensions, etc.) that can easily exceed 30 seconds.  We use the
+    // user-configurable data timeout as the hard ceiling and separately
+    // track "idle time" (no output changes) — if nothing happens for 30s
+    // the CLI is likely stuck, even if the wall-clock timeout hasn't hit.
+    let idle_timeout = Duration::from_secs(30);
+    let max_prompt_timeout = Duration::from_secs(config.timeout);
     let data_timeout = Duration::from_secs(config.timeout);
 
     if config.verbose {
@@ -561,50 +537,46 @@ pub fn run_gemini(config: &UsageConfig) -> Result<UsageData> {
         eprintln!("[verbose] Launched gemini, waiting for prompt...");
     }
 
-    // Wait for Gemini prompt — match prompt OR dialog so we don't time out
-    let prompt_result = session.wait_for(
-        gemini_prompt_ready,
-        prompt_timeout,
-        poll_interval,
-        false,
-        config.verbose,
-    );
+    // Poll for prompt readiness, handling dialogs as they appear.
+    // Track content changes to distinguish "still starting up" from "stuck".
+    let prompt_start = std::time::Instant::now();
+    let mut last_activity = std::time::Instant::now();
+    let mut prev_content = String::new();
 
-    if let Err(e) = prompt_result {
-        // Check for dialogs before giving up
-        if handle_dialog_check(
-            &mut session,
-            detect_gemini_dialog,
-            "gemini",
-            config.approval_policy,
-            config.verbose,
-        )? {
-            // Dialog dismissed, retry waiting for prompt
-            session
-                .wait_for(
-                    gemini_prompt_ready,
-                    prompt_timeout,
-                    poll_interval,
-                    false,
-                    config.verbose,
-                )
-                .context(
-                    "[timeout] Timed out waiting for Gemini prompt after dismissing dialog.",
-                )?;
-        } else {
+    loop {
+        let wall_elapsed = prompt_start.elapsed();
+        let idle_elapsed = last_activity.elapsed();
+
+        if wall_elapsed >= max_prompt_timeout || idle_elapsed >= idle_timeout {
             let pane = session.capture_pane().unwrap_or_default();
             let tail = content_tail(&pane, 500);
-            return Err(e.context(format!(
-                "Timed out waiting for Gemini prompt. Is gemini authenticated? Try running 'gemini' manually.\nLast captured output:\n{}",
+            bail!(
+                "[timeout] Timed out waiting for Gemini prompt. Is gemini authenticated? \
+                 Try running 'gemini' manually.\nLast captured output:\n{}",
                 tail
-            )));
+            );
         }
-    } else {
-        // wait_for succeeded — check if what we matched was actually a dialog
+
         let content = session.capture_pane()?;
+
+        // Track activity: reset idle timer when content changes
+        if content != prev_content {
+            if config.verbose && !prev_content.is_empty() {
+                eprintln!("[verbose] Gemini startup activity detected, resetting idle timer");
+            }
+            last_activity = std::time::Instant::now();
+            prev_content = content.clone();
+        }
+
+        // Check if the actual prompt is visible
+        if gemini_prompt_ready(&content) {
+            break;
+        }
+
+        // Check for dialogs during startup
         if let Some(kind) = detect_gemini_dialog(&content) {
             if config.verbose {
-                eprintln!("[verbose] Dialog detected after prompt wait: {:?}", kind);
+                eprintln!("[verbose] Dialog detected during prompt wait: {:?}", kind);
             }
             match config.approval_policy {
                 ApprovalPolicy::Fail => {
@@ -616,21 +588,16 @@ pub fn run_gemini(config: &UsageConfig) -> Result<UsageData> {
                         bail!("[timeout] {}", dialog_error_message(&kind, "gemini"));
                     }
                     if config.verbose {
-                        eprintln!("[verbose] Dialog dismissed, waiting for actual prompt...");
+                        eprintln!("[verbose] Dialog dismissed, continuing...");
                     }
-                    // Re-wait for the actual prompt after dialog dismissal
-                    session
-                        .wait_for(
-                            gemini_prompt_ready,
-                            prompt_timeout,
-                            poll_interval,
-                            false,
-                            config.verbose,
-                        )
-                        .context("[timeout] Timed out waiting for Gemini prompt after dismissing dialog.")?;
+                    last_activity = std::time::Instant::now();
+                    prev_content.clear();
+                    continue;
                 }
             }
         }
+
+        std::thread::sleep(poll_interval);
     }
 
     // Wait for TUI to stabilize instead of fixed sleep
@@ -714,26 +681,23 @@ pub fn run_all(config: &UsageConfig) -> AllResults {
     let mut results = Vec::new();
     let mut warnings = BTreeMap::new();
 
-    match run_claude(config) {
-        Ok(data) => results.push(data),
-        Err(e) => {
-            warnings.insert("claude".into(), format!("{:#}", e));
-        }
-    }
+    std::thread::scope(|s| {
+        let claude = s.spawn(|| run_claude(config));
+        let codex = s.spawn(|| run_codex(config));
+        let gemini = s.spawn(|| run_gemini(config));
 
-    match run_codex(config) {
-        Ok(data) => results.push(data),
-        Err(e) => {
-            warnings.insert("codex".into(), format!("{:#}", e));
+        for (name, handle) in [("claude", claude), ("codex", codex), ("gemini", gemini)] {
+            match handle.join() {
+                Ok(Ok(data)) => results.push(data),
+                Ok(Err(e)) => {
+                    warnings.insert(name.into(), format!("{:#}", e));
+                }
+                Err(_) => {
+                    warnings.insert(name.into(), "Provider thread panicked".into());
+                }
+            }
         }
-    }
-
-    match run_gemini(config) {
-        Ok(data) => results.push(data),
-        Err(e) => {
-            warnings.insert("gemini".into(), format!("{:#}", e));
-        }
-    }
+    });
 
     AllResults { results, warnings }
 }
@@ -891,13 +855,15 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_prompt_ready_legacy_gemini_cli() {
-        assert!(gemini_prompt_ready("Welcome to Gemini CLI v0.28.0"));
+    fn test_gemini_prompt_ready_not_banner_only() {
+        // Banner text alone doesn't mean the prompt is ready
+        assert!(!gemini_prompt_ready("Welcome to Gemini CLI v0.28.0"));
     }
 
     #[test]
-    fn test_gemini_prompt_ready_legacy_trust_dialog() {
-        assert!(gemini_prompt_ready("Do you trust this folder"));
+    fn test_gemini_prompt_ready_not_trust_dialog() {
+        // Dialog screens are handled separately, not by prompt readiness
+        assert!(!gemini_prompt_ready("Do you trust this folder"));
     }
 
     #[test]
@@ -939,44 +905,44 @@ mod tests {
         assert!(!gemini_prompt_ready("5 > 3"));
     }
 
+    // ── gemini_prompt_ready: startup text must NOT match ───────────
+    // These appear before the CLI is ready; handled by dialog detection.
+
     #[test]
-    fn test_gemini_prompt_ready_signed_in() {
-        assert!(gemini_prompt_ready("Signed in as user@gmail.com"));
+    fn test_gemini_prompt_ready_not_signed_in() {
+        assert!(!gemini_prompt_ready("Signed in as user@gmail.com"));
     }
 
     #[test]
-    fn test_gemini_prompt_ready_logged_in() {
-        assert!(gemini_prompt_ready("Logged in as user@gmail.com"));
+    fn test_gemini_prompt_ready_not_logged_in() {
+        assert!(!gemini_prompt_ready("Logged in as user@gmail.com"));
     }
 
     #[test]
-    fn test_gemini_prompt_ready_model_indicator() {
-        assert!(gemini_prompt_ready("Model: gemini-2.5-pro"));
+    fn test_gemini_prompt_ready_not_logged_in_with() {
+        assert!(!gemini_prompt_ready(
+            "Logged in with Google: user@gmail.com"
+        ));
     }
 
     #[test]
-    fn test_gemini_prompt_ready_select_theme() {
-        assert!(gemini_prompt_ready("Select a theme"));
+    fn test_gemini_prompt_ready_not_model_indicator() {
+        assert!(!gemini_prompt_ready("Model: gemini-2.5-pro"));
     }
 
     #[test]
-    fn test_gemini_prompt_ready_choose_theme() {
-        assert!(gemini_prompt_ready("Choose a theme for the CLI"));
+    fn test_gemini_prompt_ready_not_select_theme() {
+        assert!(!gemini_prompt_ready("Select a theme"));
     }
 
     #[test]
-    fn test_gemini_prompt_ready_update_available() {
-        assert!(gemini_prompt_ready("Update available: v0.29.0"));
+    fn test_gemini_prompt_ready_not_update_available() {
+        assert!(!gemini_prompt_ready("Update available: v0.29.0"));
     }
 
     #[test]
-    fn test_gemini_prompt_ready_new_version() {
-        assert!(gemini_prompt_ready("New version available"));
-    }
-
-    #[test]
-    fn test_gemini_prompt_ready_terms() {
-        assert!(gemini_prompt_ready(
+    fn test_gemini_prompt_ready_not_terms() {
+        assert!(!gemini_prompt_ready(
             "Please accept the terms of service"
         ));
     }
@@ -1025,13 +991,13 @@ mod tests {
     // ── gemini_prompt_ready: additional edge cases ──────────────────
 
     #[test]
-    fn test_gemini_prompt_ready_google_account() {
-        assert!(gemini_prompt_ready("Using Google Account user@gmail.com"));
+    fn test_gemini_prompt_ready_not_google_account() {
+        assert!(!gemini_prompt_ready("Using Google Account user@gmail.com"));
     }
 
     #[test]
-    fn test_gemini_prompt_ready_color_theme() {
-        assert!(gemini_prompt_ready("Pick a color theme for the CLI"));
+    fn test_gemini_prompt_ready_not_color_theme() {
+        assert!(!gemini_prompt_ready("Pick a color theme for the CLI"));
     }
 
     #[test]

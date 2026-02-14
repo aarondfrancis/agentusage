@@ -3,7 +3,11 @@
 use anyhow::Result;
 use clap::Parser;
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use agentusage::{
     run_all, run_claude, run_codex, run_gemini, AllResults, ApprovalPolicy, PercentKind,
@@ -121,6 +125,212 @@ fn run_doctor() {
         println!("\nSome required provider dependencies are missing.");
         std::process::exit(1);
     }
+}
+
+struct Spinner {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Spinner {
+    fn start(message: &str) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let msg = message.to_string();
+
+        let handle = std::thread::spawn(move || {
+            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let mut i = 0;
+            let mut stderr = std::io::stderr();
+            while !stop_clone.load(Ordering::Relaxed) {
+                let _ = write!(stderr, "\r{} {}", frames[i % frames.len()], msg);
+                let _ = stderr.flush();
+                std::thread::sleep(Duration::from_millis(80));
+                i += 1;
+            }
+            // Clear the spinner line
+            let _ = write!(stderr, "\r{}\r", " ".repeat(msg.len() + 4));
+            let _ = stderr.flush();
+        });
+
+        Spinner {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            h.join().ok();
+        }
+    }
+}
+
+// ── Multi-provider progress display ──────────────────────────────
+
+#[derive(Clone, Copy, PartialEq)]
+enum ProviderStatus {
+    Waiting,
+    Done,
+    Failed,
+}
+
+struct MultiSpinner {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl MultiSpinner {
+    fn start(names: &[&str], states: Arc<Mutex<Vec<ProviderStatus>>>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+
+        let handle = std::thread::spawn(move || {
+            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let mut i = 0;
+            let n = names.len();
+            let mut stderr = std::io::stderr();
+            let mut first = true;
+
+            while !stop_clone.load(Ordering::Relaxed) {
+                if !first && n > 1 {
+                    // Move cursor up to overwrite previous lines
+                    // Cursor is on line n, move up n-1 to reach line 1
+                    let _ = write!(stderr, "\x1b[{}A", n - 1);
+                }
+
+                let st = states.lock().unwrap();
+                for (j, name) in names.iter().enumerate() {
+                    let _ = write!(stderr, "\r\x1b[2K");
+                    match st[j] {
+                        ProviderStatus::Waiting => {
+                            let _ = write!(
+                                stderr,
+                                "{} Checking {}...",
+                                frames[i % frames.len()],
+                                name
+                            );
+                        }
+                        ProviderStatus::Done => {
+                            let _ = write!(stderr, "\x1b[32m✓\x1b[0m {}", name);
+                        }
+                        ProviderStatus::Failed => {
+                            let _ = write!(stderr, "\x1b[33m✗\x1b[0m {}", name);
+                        }
+                    }
+                    if j < n - 1 {
+                        let _ = writeln!(stderr);
+                    }
+                }
+                drop(st);
+
+                // Park cursor on the last line (no trailing newline)
+                let _ = stderr.flush();
+                first = false;
+                std::thread::sleep(Duration::from_millis(80));
+                i += 1;
+            }
+
+            // Clear all lines
+            if !first {
+                // Move to first line
+                if n > 1 {
+                    let _ = write!(stderr, "\x1b[{}A", n - 1);
+                }
+                for j in 0..n {
+                    let _ = write!(stderr, "\r\x1b[2K");
+                    if j < n - 1 {
+                        let _ = write!(stderr, "\x1b[B");
+                    }
+                }
+                // Return to first line
+                if n > 1 {
+                    let _ = write!(stderr, "\x1b[{}A", n - 1);
+                }
+                let _ = write!(stderr, "\r");
+                let _ = stderr.flush();
+            }
+        });
+
+        MultiSpinner {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for MultiSpinner {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            h.join().ok();
+        }
+    }
+}
+
+/// Run all providers in parallel with per-provider progress display.
+fn run_all_with_progress(config: &UsageConfig) -> AllResults {
+    let names = ["claude", "codex", "gemini"];
+    let states = Arc::new(Mutex::new(vec![ProviderStatus::Waiting; 3]));
+    let spinner = MultiSpinner::start(&names, states.clone());
+
+    let mut results = Vec::new();
+    let mut warnings = BTreeMap::new();
+
+    std::thread::scope(|s| {
+        let st0 = states.clone();
+        let h0 = s.spawn(move || {
+            let r = run_claude(config);
+            st0.lock().unwrap()[0] = if r.is_ok() {
+                ProviderStatus::Done
+            } else {
+                ProviderStatus::Failed
+            };
+            r
+        });
+
+        let st1 = states.clone();
+        let h1 = s.spawn(move || {
+            let r = run_codex(config);
+            st1.lock().unwrap()[1] = if r.is_ok() {
+                ProviderStatus::Done
+            } else {
+                ProviderStatus::Failed
+            };
+            r
+        });
+
+        let st2 = states.clone();
+        let h2 = s.spawn(move || {
+            let r = run_gemini(config);
+            st2.lock().unwrap()[2] = if r.is_ok() {
+                ProviderStatus::Done
+            } else {
+                ProviderStatus::Failed
+            };
+            r
+        });
+
+        for (name, handle) in [("claude", h0), ("codex", h1), ("gemini", h2)] {
+            match handle.join() {
+                Ok(Ok(data)) => results.push(data),
+                Ok(Err(e)) => {
+                    warnings.insert(name.into(), format!("{:#}", e));
+                }
+                Err(_) => {
+                    warnings.insert(name.into(), "Provider thread panicked".into());
+                }
+            }
+        }
+    });
+
+    drop(spinner);
+
+    AllResults { results, warnings }
 }
 
 fn print_human(data: &UsageData) {
@@ -284,9 +494,21 @@ fn main() {
     .expect("Failed to set Ctrl+C handler");
 
     let config = cli.to_config();
+    let show_progress = !cli.json && !cli.verbose;
 
     if cli.claude || cli.codex || cli.gemini {
         // Single provider mode
+        let provider_name = if cli.claude {
+            "claude"
+        } else if cli.codex {
+            "codex"
+        } else {
+            "gemini"
+        };
+        let spinner = show_progress.then(|| {
+            Spinner::start(&format!("Checking {}...", provider_name))
+        });
+
         let result = if cli.claude {
             run_claude(&config)
         } else if cli.codex {
@@ -294,6 +516,8 @@ fn main() {
         } else {
             run_gemini(&config)
         };
+
+        drop(spinner);
 
         match result {
             Ok(data) => {
@@ -322,8 +546,12 @@ fn main() {
             }
         }
     } else {
-        // All providers mode
-        let all = run_all(&config);
+        // All providers mode (parallel)
+        let all = if show_progress {
+            run_all_with_progress(&config)
+        } else {
+            run_all(&config)
+        };
 
         if all.results.is_empty() {
             if cli.json {

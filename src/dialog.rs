@@ -63,7 +63,10 @@ pub fn detect_gemini_dialog(content: &str) -> Option<DialogKind> {
         return Some(DialogKind::FirstRunSetup);
     }
     // Priority 3: Update available → UpdatePrompt
-    if lower.contains("update available") || lower.contains("new version") {
+    // Exclude extension update notices (informational, not interactive dialogs)
+    if (lower.contains("update available") || lower.contains("new version"))
+        && !lower.contains("extension")
+    {
         return Some(DialogKind::UpdatePrompt);
     }
     // Priority 4: Terms acceptance → TermsAcceptance
@@ -125,6 +128,12 @@ pub fn dialog_error_message(kind: &DialogKind, provider: &str) -> String {
 pub fn dismiss_dialog(kind: &DialogKind, session: &mut Session) -> Result<bool> {
     match kind {
         DialogKind::AuthRequired | DialogKind::FirstRunSetup => Ok(false),
+        DialogKind::UpdatePrompt => {
+            // Never accept updates on behalf of the user; press Escape to skip
+            session.send_keys("Escape")?;
+            thread::sleep(Duration::from_secs(1));
+            Ok(true)
+        }
         _ => {
             session.send_keys("Enter")?;
             thread::sleep(Duration::from_secs(1));
@@ -555,6 +564,25 @@ mod tests {
     #[test]
     fn test_detect_gemini_no_dialog_model_info() {
         assert_eq!(detect_gemini_dialog("Model: gemini-2.5-pro"), None);
+    }
+
+    #[test]
+    fn test_detect_gemini_no_dialog_extension_update() {
+        // Extension update notices are informational, not interactive dialogs
+        assert_eq!(
+            detect_gemini_dialog(
+                "ℹ You have 1 extension with an update available. Run \"/extensions update chrome-devtools-mcp\"."
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_detect_gemini_no_dialog_extension_new_version() {
+        assert_eq!(
+            detect_gemini_dialog("Extension chrome-devtools-mcp: new version available"),
+            None
+        );
     }
 
     #[test]
