@@ -43,7 +43,7 @@ Download a prebuilt binary from [Releases](https://github.com/aarondfrancis/agen
 agentusage [OPTIONS]
 ```
 
-By default, checks all installed providers sequentially and reports results:
+By default, checks all installed providers in parallel and reports results:
 
 ```
 $ agentusage
@@ -166,7 +166,7 @@ Use `--approval-policy accept` to automatically dismiss dialogs that can be acce
 5. Parses percentages, reset times, and spend from the TUI output
 6. Cleans up the process/session on exit (including Ctrl+C)
 
-Each provider runs in its own session. When checking all providers, they run sequentially.
+Each provider runs in its own PTY session. When checking all providers, they run in parallel.
 
 ## Library usage
 
@@ -211,7 +211,7 @@ cargo build
 cargo test
 ```
 
-130 tests cover parsing, PTY session hardening, reset time computation, CLI flag validation, JSON serialization, and dialog detection.
+190+ tests cover parsing, PTY session hardening, reset time computation, CLI flag validation, JSON serialization, and dialog detection.
 
 ## License
 
