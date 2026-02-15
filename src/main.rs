@@ -208,12 +208,8 @@ impl MultiSpinner {
                     let _ = write!(stderr, "\r\x1b[2K");
                     match st[j] {
                         ProviderStatus::Waiting => {
-                            let _ = write!(
-                                stderr,
-                                "{} Checking {}...",
-                                frames[i % frames.len()],
-                                name
-                            );
+                            let _ =
+                                write!(stderr, "{} Checking {}...", frames[i % frames.len()], name);
                         }
                         ProviderStatus::Done => {
                             let _ = write!(stderr, "\x1b[32m✓\x1b[0m {}", name);
@@ -505,9 +501,8 @@ fn main() {
         } else {
             "gemini"
         };
-        let spinner = show_progress.then(|| {
-            Spinner::start(&format!("Checking {}...", provider_name))
-        });
+        let spinner =
+            show_progress.then(|| Spinner::start(&format!("Checking {}...", provider_name)));
 
         let result = if cli.claude {
             run_claude(&config)

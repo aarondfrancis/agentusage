@@ -942,9 +942,7 @@ mod tests {
 
     #[test]
     fn test_gemini_prompt_ready_not_terms() {
-        assert!(!gemini_prompt_ready(
-            "Please accept the terms of service"
-        ));
+        assert!(!gemini_prompt_ready("Please accept the terms of service"));
     }
 
     #[test]

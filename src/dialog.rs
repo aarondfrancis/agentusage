@@ -547,18 +547,12 @@ mod tests {
 
     #[test]
     fn test_detect_gemini_no_dialog_signed_in() {
-        assert_eq!(
-            detect_gemini_dialog("Signed in as user@gmail.com"),
-            None
-        );
+        assert_eq!(detect_gemini_dialog("Signed in as user@gmail.com"), None);
     }
 
     #[test]
     fn test_detect_gemini_no_dialog_logged_in() {
-        assert_eq!(
-            detect_gemini_dialog("Logged in as user@gmail.com"),
-            None
-        );
+        assert_eq!(detect_gemini_dialog("Logged in as user@gmail.com"), None);
     }
 
     #[test]
@@ -599,10 +593,7 @@ mod tests {
     #[test]
     fn test_detect_gemini_no_dialog_what_can_i_help() {
         // Ready indicator is not a dialog
-        assert_eq!(
-            detect_gemini_dialog("What can I help you with?"),
-            None
-        );
+        assert_eq!(detect_gemini_dialog("What can I help you with?"), None);
     }
 
     #[test]
