@@ -1247,8 +1247,7 @@ Weekly limit:  [████] 80% left (resets 12:00 on 20 Feb)
         // "ResetsFeb20at9am(America/Chicago)" = 9:00 CST = 15:00 UTC on Feb 20
         // Delta = 7 days + 3 hours = 10260 minutes
         let now = Utc.with_ymd_and_hms(2026, 2, 13, 12, 0, 0).unwrap();
-        let result =
-            parse_reset_minutes_at("ResetsFeb20at9am(America/Chicago)", "claude", now);
+        let result = parse_reset_minutes_at("ResetsFeb20at9am(America/Chicago)", "claude", now);
         assert_eq!(result, Some(7 * 24 * 60 + 3 * 60));
     }
 

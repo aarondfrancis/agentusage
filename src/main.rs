@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agentusage::{
-    run_all, run_claude, run_codex, run_gemini, AllResults, ApprovalPolicy, PercentKind, UsageConfig,
-    UsageData, UsageEntry,
+    run_all, run_claude, run_codex, run_gemini, AllResults, ApprovalPolicy, PercentKind,
+    UsageConfig, UsageData, UsageEntry,
 };
 
 #[derive(Parser)]
@@ -339,7 +339,14 @@ fn print_human(data: &UsageData) {
     println!("{}", title);
     let mut table = Table::new();
     table.load_preset(ASCII_BORDERS_ONLY_CONDENSED);
-    table.set_header(vec!["Limit", "Remaining", "Days", "Minutes", "Hours", "Spend"]);
+    table.set_header(vec![
+        "Limit",
+        "Remaining",
+        "Days",
+        "Minutes",
+        "Hours",
+        "Spend",
+    ]);
 
     for entry in &data.entries {
         table.add_row(vec![
@@ -467,7 +474,10 @@ fn build_provider_json(data: &UsageData) -> serde_json::Value {
         obj.insert("reset_info".into(), serde_json::json!(entry.reset_info));
         if let Some(mins) = entry.reset_minutes {
             obj.insert("reset_minutes".into(), serde_json::json!(mins));
-            obj.insert("reset_hours".into(), serde_json::json!(round2(mins as f64 / 60.0)));
+            obj.insert(
+                "reset_hours".into(),
+                serde_json::json!(round2(mins as f64 / 60.0)),
+            );
             obj.insert(
                 "reset_days".into(),
                 serde_json::json!(round2(mins as f64 / (24.0 * 60.0))),
