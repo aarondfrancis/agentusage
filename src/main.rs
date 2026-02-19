@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use clap::Parser;
+use comfy_table::{presets::ASCII_BORDERS_ONLY_CONDENSED, Table};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::process::Command;
@@ -10,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agentusage::{
-    run_all, run_claude, run_codex, run_gemini, AllResults, ApprovalPolicy, PercentKind,
-    UsageConfig, UsageData,
+    run_all, run_claude, run_codex, run_gemini, AllResults, ApprovalPolicy, PercentKind, UsageConfig,
+    UsageData, UsageEntry,
 };
 
 #[derive(Parser)]
@@ -336,55 +337,125 @@ fn print_human(data: &UsageData) {
         _ => "Claude Code Usage",
     };
     println!("{}", title);
-    println!("{}", "─".repeat(60));
+    let mut table = Table::new();
+    table.load_preset(ASCII_BORDERS_ONLY_CONDENSED);
+    table.set_header(vec!["Limit", "Remaining", "Days", "Minutes", "Hours", "Spend"]);
 
     for entry in &data.entries {
-        let (display_pct, kind) = match entry.percent_kind {
-            PercentKind::Used => (entry.percent_used, "used"),
-            PercentKind::Left => (entry.percent_remaining, "left"),
-        };
-
-        let spent_str = entry
-            .spent
-            .as_ref()
-            .map(|s| format!(" · {}", s))
-            .unwrap_or_default();
-
-        let requests_str = entry
-            .requests
-            .as_ref()
-            .map(|r| format!(" · {} reqs", r))
-            .unwrap_or_default();
-
-        let reset_str = if entry.reset_info.is_empty() {
-            String::new()
-        } else {
-            format!(" · {}", entry.reset_info)
-        };
-
-        println!(
-            "{:<30} {:>5}% {}{}{}{}",
-            format!("{}:", entry.label),
-            display_pct,
-            kind,
-            requests_str,
-            spent_str,
-            reset_str,
-        );
+        table.add_row(vec![
+            entry.label.clone(),
+            remaining_pct_cell(entry),
+            reset_days_cell(entry),
+            reset_minutes_cell(entry),
+            reset_hours_cell(entry),
+            spent_cell(entry),
+        ]);
     }
+
+    println!("{}", table);
 }
 
 fn print_human_multi(results: &[UsageData]) {
-    for (i, data) in results.iter().enumerate() {
-        if i > 0 {
-            println!();
+    let mut table = Table::new();
+    table.load_preset(ASCII_BORDERS_ONLY_CONDENSED);
+    table.set_header(vec![
+        "Provider",
+        "Limit",
+        "Remaining",
+        "Days",
+        "Minutes",
+        "Hours",
+        "Spend",
+    ]);
+
+    let mut boundaries = Vec::new();
+    let mut row_count = 0usize;
+    for (idx, data) in results.iter().enumerate() {
+        let mut added_for_provider = 0usize;
+        for entry in &data.entries {
+            table.add_row(vec![
+                provider_label(&data.provider).to_string(),
+                entry.label.clone(),
+                remaining_pct_cell(entry),
+                reset_days_cell(entry),
+                reset_minutes_cell(entry),
+                reset_hours_cell(entry),
+                spent_cell(entry),
+            ]);
+            row_count += 1;
+            added_for_provider += 1;
         }
-        print_human(data);
+
+        if idx + 1 < results.len() && added_for_provider > 0 {
+            boundaries.push(row_count);
+        }
     }
+
+    let mut lines: Vec<String> = table.to_string().lines().map(|s| s.to_string()).collect();
+    if lines.len() >= 4 {
+        let divider = lines[0].clone();
+        let mut inserted = 0usize;
+        for boundary in boundaries {
+            let insert_at = 3 + boundary + inserted;
+            if insert_at < lines.len().saturating_sub(1) {
+                lines.insert(insert_at, divider.clone());
+                inserted += 1;
+            }
+        }
+    }
+
+    println!("Usage");
+    println!("{}", lines.join("\n"));
+}
+
+fn provider_label(provider: &str) -> &str {
+    match provider {
+        "claude" => "Claude",
+        "codex" => "Codex",
+        "gemini" => "Gemini",
+        _ => provider,
+    }
+}
+
+fn remaining_pct_cell(entry: &UsageEntry) -> String {
+    let remaining = match entry.percent_kind {
+        PercentKind::Used => entry.percent_remaining,
+        PercentKind::Left => entry.percent_remaining,
+    };
+    format!("{}%", remaining)
+}
+
+fn spent_cell(entry: &UsageEntry) -> String {
+    entry.spent.clone().unwrap_or_default()
+}
+
+fn reset_days_cell(entry: &UsageEntry) -> String {
+    entry
+        .reset_minutes
+        .map(|mins| format!("{:.2}", mins as f64 / (24.0 * 60.0)))
+        .unwrap_or_default()
+}
+
+fn reset_minutes_cell(entry: &UsageEntry) -> String {
+    entry
+        .reset_minutes
+        .map(|mins| mins.to_string())
+        .unwrap_or_default()
+}
+
+fn reset_hours_cell(entry: &UsageEntry) -> String {
+    entry
+        .reset_minutes
+        .map(|mins| format!("{:.2}", mins as f64 / 60.0))
+        .unwrap_or_default()
 }
 
 /// Build a JSON object for a single provider: { label: { ...fields }, ... }
 fn build_provider_json(data: &UsageData) -> serde_json::Value {
+    fn round2(v: f64) -> f64 {
+        (v * 100.0).round() / 100.0
+    }
+
     let mut entries = serde_json::Map::new();
     for entry in &data.entries {
         let mut obj = serde_json::Map::new();
@@ -396,6 +467,11 @@ fn build_provider_json(data: &UsageData) -> serde_json::Value {
         obj.insert("reset_info".into(), serde_json::json!(entry.reset_info));
         if let Some(mins) = entry.reset_minutes {
             obj.insert("reset_minutes".into(), serde_json::json!(mins));
+            obj.insert("reset_hours".into(), serde_json::json!(round2(mins as f64 / 60.0)));
+            obj.insert(
+                "reset_days".into(),
+                serde_json::json!(round2(mins as f64 / (24.0 * 60.0))),
+            );
         }
         if let Some(ref spent) = entry.spent {
             obj.insert("spent".into(), serde_json::json!(spent));
@@ -840,7 +916,33 @@ mod tests {
         assert_eq!(entry["percent_remaining"], 58);
         // reset_minutes is None, should be absent
         assert!(!entry.contains_key("reset_minutes"));
+        assert!(!entry.contains_key("reset_hours"));
+        assert!(!entry.contains_key("reset_days"));
         // spent is None, should be absent
         assert!(!entry.contains_key("spent"));
+    }
+
+    #[test]
+    fn test_build_provider_json_includes_derived_reset_fields() {
+        let data = UsageData {
+            provider: "claude".into(),
+            entries: vec![UsageEntry {
+                label: "session".into(),
+                percent_used: 42,
+                percent_kind: PercentKind::Used,
+                reset_info: "Resets 2pm".into(),
+                percent_remaining: 58,
+                reset_minutes: Some(90),
+                spent: None,
+                requests: None,
+            }],
+        };
+
+        let json = build_provider_json(&data);
+        let obj = json.as_object().unwrap();
+        let entry = obj["session"].as_object().unwrap();
+        assert_eq!(entry["reset_minutes"], 90);
+        assert_eq!(entry["reset_hours"], serde_json::json!(1.5));
+        assert_eq!(entry["reset_days"], serde_json::json!(0.06));
     }
 }

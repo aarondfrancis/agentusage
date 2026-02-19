@@ -4,6 +4,28 @@ use anyhow::Result;
 use std::thread;
 use std::time::Duration;
 
+fn is_auth_required_prompt(lower: &str) -> bool {
+    const AUTH_PHRASES: &[&str] = &[
+        "sign in required",
+        "log in required",
+        "login required",
+        "please sign in",
+        "please log in",
+        "you need to sign in",
+        "you need to log in",
+        "sign in to continue",
+        "log in to continue",
+        "sign in with",
+        "log in with",
+        "must authenticate",
+        "please authenticate",
+        "authentication required",
+        "authenticate before using",
+    ];
+
+    AUTH_PHRASES.iter().any(|phrase| lower.contains(phrase))
+}
+
 /// Detect Claude-specific dialogs in screen content.
 pub fn detect_claude_dialog(content: &str) -> Option<DialogKind> {
     let lower = content.to_lowercase();
@@ -11,7 +33,7 @@ pub fn detect_claude_dialog(content: &str) -> Option<DialogKind> {
     if lower.contains("update available") || lower.contains("new version") {
         return Some(DialogKind::UpdatePrompt);
     }
-    if lower.contains("sign in") || lower.contains("log in") || lower.contains("authenticate") {
+    if is_auth_required_prompt(&lower) {
         return Some(DialogKind::AuthRequired);
     }
     if lower.contains("welcome to claude") || lower.contains("first time") {
@@ -39,7 +61,7 @@ pub fn detect_codex_dialog(content: &str) -> Option<DialogKind> {
     if lower.contains("sandbox") && lower.contains("trust") {
         return Some(DialogKind::SandboxTrust);
     }
-    if lower.contains("sign in") || lower.contains("log in") || lower.contains("authenticate") {
+    if is_auth_required_prompt(&lower) {
         return Some(DialogKind::AuthRequired);
     }
 
@@ -74,7 +96,7 @@ pub fn detect_gemini_dialog(content: &str) -> Option<DialogKind> {
         return Some(DialogKind::TermsAcceptance);
     }
     // Priority 5: Auth required (last so specific checks win)
-    if lower.contains("sign in") || lower.contains("log in") || lower.contains("authenticate") {
+    if is_auth_required_prompt(&lower) {
         return Some(DialogKind::AuthRequired);
     }
 
@@ -316,6 +338,12 @@ mod tests {
             detect_claude_dialog("Sign In Required"),
             Some(DialogKind::AuthRequired)
         );
+    }
+
+    #[test]
+    fn test_detect_claude_authenticated_status_is_not_auth_dialog() {
+        let content = "Authenticated as user@example.com";
+        assert_eq!(detect_claude_dialog(content), None);
     }
 
     #[test]

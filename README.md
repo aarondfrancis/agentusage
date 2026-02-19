@@ -48,21 +48,20 @@ By default, checks all installed providers in parallel and reports results:
 ```
 $ agentusage
 
-Claude Code Usage
-────────────────────────────────────────────────────────
-Current session:                   1% used · Resets 2pm (America/Chicago)
-Current week (all models):         0% used · Resets Feb 20 at 9am (America/Chicago)
-Extra usage:                      15% used · $77.33 / $500.00 spent · Resets Mar 1 (America/Chicago)
-
-Codex Usage
-────────────────────────────────────────────────────────
-5h limit:                         97% left · resets 11:07
-Weekly limit:                     71% left · resets 12:07 on 16 Feb
-
-Gemini Usage
-────────────────────────────────────────────────────────
-gemini-2.5-pro:                   98% left · Resets in 2h 35m
-gemini-2.5-flash:                 99% left · 6 reqs · Resets in 4h 49m
+Usage
++----------+----------------------------+-----------+-------+---------+--------+---------------------+
+| Provider | Limit                      | Remaining | Days  | Minutes | Hours  | Spend               |
++=====================================================================================================+
+| Claude   | Current session            | 99%       | 0.33  | 480     | 8.00   |                     |
+| Claude   | Current week (all models) | 100%      | 7.13  | 10260   | 171.00 |                     |
+| Claude   | Extra usage                | 85%       | 15.75 | 22680   | 378.00 | $77.33/$500.00spent |
++----------+----------------------------+-----------+-------+---------+--------+---------------------+
+| Codex    | 5h limit                   | 97%       | 0.08  | 120     | 2.00   |                     |
+| Codex    | Weekly limit               | 71%       | 2.96  | 4260    | 71.00  |                     |
++----------+----------------------------+-----------+-------+---------+--------+---------------------+
+| Gemini   | gemini-2.5-pro             | 98%       | 0.11  | 155     | 2.58   |                     |
+| Gemini   | gemini-2.5-flash           | 99%       | 0.20  | 289     | 4.82   |                     |
++----------+----------------------------+-----------+-------+---------+--------+---------------------+
 ```
 
 ### Single provider
@@ -88,7 +87,9 @@ agentusage --json
         "percent_used": 1,
         "percent_remaining": 99,
         "reset_info": "Resets 2pm (America/Chicago)",
-        "reset_minutes": 480
+        "reset_minutes": 480,
+        "reset_hours": 8.0,
+        "reset_days": 0.33
       }
     },
     "codex": {
@@ -96,7 +97,9 @@ agentusage --json
         "percent_used": 3,
         "percent_remaining": 97,
         "reset_info": "resets 11:07",
-        "reset_minutes": 120
+        "reset_minutes": 120,
+        "reset_hours": 2.0,
+        "reset_days": 0.08
       }
     }
   }
@@ -123,6 +126,8 @@ When some providers fail but others succeed, warnings appear as a keyed object:
 | `percent_remaining` | `u32` | Percentage of quota remaining (0-100) |
 | `reset_info` | `string` | Raw reset text from the provider |
 | `reset_minutes` | `i64?` | Minutes until reset (omitted if unparseable) |
+| `reset_hours` | `f64?` | Hours until reset, derived from `reset_minutes` (2 decimal places) |
+| `reset_days` | `f64?` | Days until reset, derived from `reset_minutes` (2 decimal places) |
 | `spent` | `string?` | Spend info, e.g. `$77.33 / $500.00 spent` (Claude only) |
 | `requests` | `string?` | Request count (Gemini only) |
 

@@ -444,8 +444,9 @@ fn parse_claude_reset(reset_info: &str, now_utc: DateTime<Utc>) -> Option<i64> {
 
     let now_tz = now_utc.with_timezone(&tz);
 
-    // "Resets Feb 20 at 9am (...)"
-    let date_time_re = Regex::new(r"(?i)Resets?\s+(\w+)\s+(\d{1,2})\s+at\s+(.+?)\s*\(").ok()?;
+    // "Resets Feb 20 at 9am (...)" or compact "ResetsFeb20at9am(...)"
+    let date_time_re =
+        Regex::new(r"(?i)Resets?\s*([A-Za-z]+)\s*(\d{1,2})\s*at\s*(.+?)\s*\(").ok()?;
     if let Some(caps) = date_time_re.captures(reset_info) {
         let month = parse_month(&caps[1])?;
         let day: u32 = caps[2].parse().ok()?;
@@ -468,8 +469,9 @@ fn parse_claude_reset(reset_info: &str, now_utc: DateTime<Utc>) -> Option<i64> {
         return Some(minutes);
     }
 
-    // "Resets 2pm (...)" - time only (today, wraps to tomorrow if past)
-    let time_re = Regex::new(r"(?i)Resets?\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm))\s*\(").ok()?;
+    // "Resets 2pm (...)" or compact "Resets10pm(...)".
+    // Time only: assume today in provider TZ and wrap to tomorrow if already past.
+    let time_re = Regex::new(r"(?i)Resets?\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm))\s*\(").ok()?;
     if let Some(caps) = time_re.captures(reset_info) {
         let (hour, min) = parse_12h_time(&caps[1])?;
 
@@ -489,8 +491,8 @@ fn parse_claude_reset(reset_info: &str, now_utc: DateTime<Utc>) -> Option<i64> {
         return Some(reset_utc.signed_duration_since(now_utc).num_minutes());
     }
 
-    // "Resets Mar 1 (...)" - date only
-    let date_re = Regex::new(r"(?i)Resets?\s+(\w+)\s+(\d{1,2})\s*\(").ok()?;
+    // "Resets Mar 1 (...)" or compact "ResetsMar1(...)" - date only
+    let date_re = Regex::new(r"(?i)Resets?\s*([A-Za-z]+)\s*(\d{1,2})\s*\(").ok()?;
     if let Some(caps) = date_re.captures(reset_info) {
         let month = parse_month(&caps[1])?;
         let day: u32 = caps[2].parse().ok()?;
@@ -1225,6 +1227,39 @@ Weekly limit:  [████] 80% left (resets 12:00 on 20 Feb)
         // Delta from Feb 13 12:00 UTC to Mar 1 06:00 UTC = 15 days 18 hours = 22680 min
         let now = Utc.with_ymd_and_hms(2026, 2, 13, 12, 0, 0).unwrap();
         let result = parse_reset_minutes_at("Resets Mar 1 (America/Chicago)", "claude", now);
+        assert_eq!(result, Some(15 * 24 * 60 + 18 * 60));
+    }
+
+    #[test]
+    fn test_claude_reset_minutes_compact_time_with_tz() {
+        use chrono::TimeZone;
+        // 12:00 UTC on Feb 13, 2026. 10pm CST is 04:00 UTC next day.
+        // Delta = 16 hours = 960 minutes
+        let now = Utc.with_ymd_and_hms(2026, 2, 13, 12, 0, 0).unwrap();
+        let result = parse_reset_minutes_at("Resets10pm(America/Chicago)", "claude", now);
+        assert_eq!(result, Some(16 * 60));
+    }
+
+    #[test]
+    fn test_claude_reset_minutes_compact_date_time_with_tz() {
+        use chrono::TimeZone;
+        // 12:00 UTC on Feb 13, 2026
+        // "ResetsFeb20at9am(America/Chicago)" = 9:00 CST = 15:00 UTC on Feb 20
+        // Delta = 7 days + 3 hours = 10260 minutes
+        let now = Utc.with_ymd_and_hms(2026, 2, 13, 12, 0, 0).unwrap();
+        let result =
+            parse_reset_minutes_at("ResetsFeb20at9am(America/Chicago)", "claude", now);
+        assert_eq!(result, Some(7 * 24 * 60 + 3 * 60));
+    }
+
+    #[test]
+    fn test_claude_reset_minutes_compact_date_only_with_tz() {
+        use chrono::TimeZone;
+        // 12:00 UTC on Feb 13, 2026
+        // "ResetsMar1(America/Chicago)" = 00:00 CST Mar 1 = 06:00 UTC Mar 1
+        // Delta from Feb 13 12:00 UTC to Mar 1 06:00 UTC = 15 days 18 hours = 22680 min
+        let now = Utc.with_ymd_and_hms(2026, 2, 13, 12, 0, 0).unwrap();
+        let result = parse_reset_minutes_at("ResetsMar1(America/Chicago)", "claude", now);
         assert_eq!(result, Some(15 * 24 * 60 + 18 * 60));
     }
 
