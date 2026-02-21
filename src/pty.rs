@@ -93,9 +93,7 @@ fn detect_query_in_stream(tail: &mut Vec<u8>, chunk: &[u8], query: &[u8]) -> boo
     combined.extend_from_slice(tail);
     combined.extend_from_slice(chunk);
 
-    let found = combined
-        .windows(query.len())
-        .any(|window| window == query);
+    let found = combined.windows(query.len()).any(|window| window == query);
 
     let tail_len = query.len().saturating_sub(1);
     tail.clear();
