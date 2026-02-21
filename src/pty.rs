@@ -64,6 +64,11 @@ pub fn clear_shutdown() {
     SHUTDOWN.store(false, Ordering::SeqCst);
 }
 
+/// Check whether the global shutdown flag is set.
+pub fn is_shutdown_requested() -> bool {
+    SHUTDOWN.load(Ordering::Relaxed)
+}
+
 fn map_special_key(keys: &str) -> &str {
     match keys {
         "Enter" => "\r",

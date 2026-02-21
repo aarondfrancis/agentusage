@@ -96,6 +96,8 @@ pub fn detect_gemini_dialog(content: &str) -> Option<DialogKind> {
         return Some(DialogKind::TermsAcceptance);
     }
     // Priority 5: Auth required (last so specific checks win)
+    // NOTE: "Waiting for auth..." is a transient spinner, NOT a dialog.
+    // It is handled by the prompt-readiness negative guard in lib.rs.
     if is_auth_required_prompt(&lower) {
         return Some(DialogKind::AuthRequired);
     }
@@ -629,6 +631,16 @@ mod tests {
         assert_eq!(
             detect_gemini_dialog("You must authenticate with Google."),
             Some(DialogKind::AuthRequired)
+        );
+    }
+
+    #[test]
+    fn test_detect_gemini_waiting_for_auth_is_not_dialog() {
+        // "Waiting for auth..." is a transient spinner, not an interactive dialog.
+        // It should NOT be detected as AuthRequired.
+        assert_eq!(
+            detect_gemini_dialog("⠋ Waiting for auth... (Press ESC or CTRL+C to cancel)"),
+            None
         );
     }
 

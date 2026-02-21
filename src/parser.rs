@@ -253,10 +253,11 @@ pub fn parse_codex_output(text: &str) -> Result<UsageData> {
 /// ```text
 /// │  gemini-2.5-flash-lite          2   99.9% (Resets in 23h 58m)
 /// │  gemini-2.5-pro                 -    98.1% (Resets in 2h 35m)
+/// │  gemini-2.5-pro                 -     99.0% resets in 23h 19m
 /// ```
 pub fn parse_gemini_output(text: &str) -> Result<UsageData> {
     let model_re = Regex::new(
-        r"^\s*(gemini-[\w.-]+)\s+(\d+|-)\s+(\d+(?:\.\d+)?)\s*%\s*\(Resets?\s+in\s+(.+?)\)",
+        r"(?i)^\s*(gemini-[\w.-]+)\s+(\d+|-)\s+(\d+(?:\.\d+)?)\s*%\s*\(?resets?\s+in\s+(.+?)\)?\s*$",
     )?;
 
     let mut entries = Vec::new();
@@ -939,6 +940,35 @@ Model-B limit:
 
         assert_eq!(data.entries[4].label, "gemini-3-pro-preview");
         assert_eq!(data.entries[4].requests, None);
+    }
+
+    #[test]
+    fn test_gemini_typical_output_no_parens() {
+        let text = r#"
+│  Model                          Reqs  Quota remaining                                                                                                                                                │
+│  gemini-2.5-flash               -     99.0% resets in 23h 19m                                                                                                                                        │
+│  gemini-2.5-flash-lite          -     99.0% resets in 23h 19m                                                                                                                                        │
+│  gemini-2.5-pro                 -      97.1% resets in 1h 13m                                                                                                                                        │
+│  gemini-3-flash-preview         -     99.0% resets in 23h 19m                                                                                                                                        │
+│  gemini-3.1-pro-preview         -      97.1% resets in 1h 13m                                                                                                                                        │
+"#;
+
+        let data = parse_gemini_output(text).unwrap();
+        assert_eq!(data.provider, "gemini");
+        assert_eq!(data.entries.len(), 5);
+
+        assert_eq!(data.entries[0].label, "gemini-2.5-flash");
+        assert_eq!(data.entries[0].percent_remaining, 99);
+        assert_eq!(data.entries[0].percent_kind, PercentKind::Left);
+        assert_eq!(data.entries[0].requests, None);
+        assert_eq!(data.entries[0].reset_info, "Resets in 23h 19m");
+
+        assert_eq!(data.entries[2].label, "gemini-2.5-pro");
+        assert_eq!(data.entries[2].percent_remaining, 97);
+
+        assert_eq!(data.entries[4].label, "gemini-3.1-pro-preview");
+        assert_eq!(data.entries[4].percent_remaining, 97);
+        assert_eq!(data.entries[4].reset_info, "Resets in 1h 13m");
     }
 
     #[test]
