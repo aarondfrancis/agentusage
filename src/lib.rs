@@ -4,7 +4,6 @@ pub mod dialog;
 pub mod parser;
 pub mod pty;
 pub mod session;
-pub mod tmux;
 pub mod types;
 
 use anyhow::{bail, Context, Result};
@@ -118,37 +117,6 @@ fn normalized_no_whitespace_lower(content: &str) -> String {
         .filter(|c| !c.is_whitespace())
         .flat_map(|c| c.to_lowercase())
         .collect()
-}
-
-/// Send `/stats session` command to Gemini via tmux.
-/// Sends text first, waits for the TUI to process it (autocomplete
-/// needs time), then sends Enter to submit.
-fn send_gemini_stats_cmd(session: &tmux::TmuxSession) -> Result<()> {
-    session.send_keys("C-u")?;
-    std::thread::sleep(Duration::from_millis(300));
-    session.send_keys_literal("/stats session")?;
-    // Wait for autocomplete to fully process the text before submitting.
-    // Without this gap, Enter gets treated as a newline in the multi-line input.
-    std::thread::sleep(Duration::from_millis(1500));
-    session.send_keys("Enter")?;
-    Ok(())
-}
-
-/// Dismiss a Gemini dialog via tmux session.
-fn dismiss_gemini_dialog(kind: &DialogKind, session: &tmux::TmuxSession) -> Result<bool> {
-    match kind {
-        DialogKind::AuthRequired | DialogKind::FirstRunSetup => Ok(false),
-        DialogKind::UpdatePrompt => {
-            session.send_keys("Escape")?;
-            std::thread::sleep(Duration::from_secs(1));
-            Ok(true)
-        }
-        _ => {
-            session.send_keys("Enter")?;
-            std::thread::sleep(Duration::from_secs(1));
-            Ok(true)
-        }
-    }
 }
 
 /// Check whether the Gemini CLI pane content indicates the prompt is
@@ -539,27 +507,43 @@ pub fn run_codex(config: &UsageConfig) -> Result<UsageData> {
 
 pub fn run_gemini(config: &UsageConfig) -> Result<UsageData> {
     check_command_exists("gemini")?;
-    check_command_exists("tmux")?;
 
-    // Gemini's Ink-based TUI doesn't reliably accept direct PTY writes
-    // for command submission.  tmux send-keys works perfectly, so we use
-    // tmux as an intermediary.
-    let session = tmux::TmuxSession::new(config.directory.as_deref(), "gemini")?;
+    let mut session = Session::new(
+        config.directory.as_deref(),
+        config.verbose,
+        SessionLaunch {
+            binary: "gemini",
+            args: &[],
+        },
+    )?;
     let poll_interval = Duration::from_millis(500);
+    // Faster polling during the first few seconds of startup.  Ink-based
+    // TUIs (Gemini) may send terminal capability queries (Device Attributes,
+    // cursor position, etc.) early and block until they receive a response.
+    // Polling at 100ms ensures we answer those queries promptly.
+    let fast_poll_interval = Duration::from_millis(100);
+    let fast_poll_duration = Duration::from_secs(5);
     // Gemini v0.28+ has a long auth validation phase (spinners, loading
     // extensions, etc.) that can easily exceed 30 seconds.  We use the
     // user-configurable data timeout as the hard ceiling and separately
-    // track "idle time" (no output changes) — if nothing happens for 30s
+    // track "idle time" (no output changes) — if nothing happens for 45s
     // the CLI is likely stuck, even if the wall-clock timeout hasn't hit.
-    let idle_timeout = Duration::from_secs(30);
+    let idle_timeout = Duration::from_secs(45);
     let max_prompt_timeout = Duration::from_secs(config.timeout);
     let data_timeout = Duration::from_secs(config.timeout);
 
     if config.verbose {
         eprintln!(
-            "[verbose] Created tmux session '{}' for gemini",
-            session.name
+            "[verbose] Created {} session for gemini",
+            session.backend_name()
         );
+    }
+
+    // Pump the PTY briefly to answer any immediate terminal queries
+    // (DA1, cursor position, DSR) the Ink TUI sends on startup.
+    for _ in 0..10 {
+        let _ = session.capture_pane();
+        std::thread::sleep(Duration::from_millis(50));
     }
 
     if config.verbose {
@@ -612,7 +596,7 @@ pub fn run_gemini(config: &UsageConfig) -> Result<UsageData> {
                     bail!("[timeout] {}", dialog_error_message(&kind, "gemini"));
                 }
                 ApprovalPolicy::Accept => {
-                    let dismissed = dismiss_gemini_dialog(&kind, &session)?;
+                    let dismissed = dismiss_dialog(&kind, &mut session)?;
                     if !dismissed {
                         bail!("[timeout] {}", dialog_error_message(&kind, "gemini"));
                     }
@@ -626,7 +610,14 @@ pub fn run_gemini(config: &UsageConfig) -> Result<UsageData> {
             }
         }
 
-        std::thread::sleep(poll_interval);
+        // Use faster polling during the initial startup phase to respond
+        // to terminal capability queries quickly.
+        let effective_poll = if prompt_start.elapsed() < fast_poll_duration {
+            fast_poll_interval
+        } else {
+            poll_interval
+        };
+        std::thread::sleep(effective_poll);
     }
 
     // Gemini v0.28+ shows a "Waiting for auth..." spinner overlay while
@@ -652,24 +643,9 @@ pub fn run_gemini(config: &UsageConfig) -> Result<UsageData> {
             }
         } else {
             // No auth spinner — wait for the TUI to fully settle.
-            // Gemini's Ink TUI continues initializing (loading extensions,
-            // rendering UI) after the prompt becomes visible.  Give it
-            // time to stabilize before sending input.
-            let _ =
-                session.wait_for_stable(Duration::from_secs(10), poll_interval, config.verbose);
+            let _ = session.wait_for_stable(Duration::from_secs(2), poll_interval, config.verbose);
         }
     }
-
-    // Extra buffer: Gemini's Ink TUI continues initialising its input
-    // handler for several seconds after the terminal output has stabilised.
-    // tmux send-keys is silently dropped if sent before the handler is ready.
-    if config.verbose {
-        eprintln!(
-            "[verbose] TUI stabilised, waiting for input handler init ({:.1}s since launch)...",
-            prompt_start.elapsed().as_secs_f64()
-        );
-    }
-    std::thread::sleep(Duration::from_secs(5));
 
     if config.verbose {
         let content = session.capture_pane()?;
@@ -677,19 +653,19 @@ pub fn run_gemini(config: &UsageConfig) -> Result<UsageData> {
     }
 
     // Type /stats session — Gemini uses this command, not /status.
-    send_gemini_stats_cmd(&session)?;
+    session.send_keys_literal("/stats session")?;
+    std::thread::sleep(Duration::from_millis(500));
+    session.send_keys("Enter")?;
 
     if config.verbose {
         eprintln!("[verbose] Sent /stats session + Enter, waiting for usage data...");
     }
 
     // Wait for usage data to appear, checking for dialogs.
-    // Re-send the command once after 10 seconds as a safety net.
     let pct_re = regex::Regex::new(r"(?i)\d+(?:\.\d+)?%\s*\(?resets?\b")?;
     let data_start = std::time::Instant::now();
     let mut content = String::new();
     let mut data_ready = false;
-    let mut resent = false;
 
     while data_start.elapsed() < data_timeout {
         content = session.capture_pane()?;
@@ -699,42 +675,19 @@ pub fn run_gemini(config: &UsageConfig) -> Result<UsageData> {
         }
 
         // Check for dialogs that may have appeared during data wait
-        {
-            if let Some(kind) = detect_gemini_dialog(&content) {
-                if config.verbose {
-                    eprintln!("[verbose] Dialog detected: {:?}", kind);
-                }
-                match config.approval_policy {
-                    ApprovalPolicy::Fail => {
-                        bail!("[timeout] {}", dialog_error_message(&kind, "gemini"));
-                    }
-                    ApprovalPolicy::Accept => {
-                        if dismiss_gemini_dialog(&kind, &session)? {
-                            if config.verbose {
-                                eprintln!("[verbose] Dialog dismissed, retrying...");
-                            }
-                            send_gemini_stats_cmd(&session)?;
-                            resent = false;
-                            std::thread::sleep(Duration::from_millis(250));
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
-
-        // One-time retry: if the first send didn't produce data after
-        // 10 seconds, try again.
-        if !resent && data_start.elapsed() >= Duration::from_secs(10) {
-            if config.verbose {
-                let tail = content_tail(&content, 500);
-                eprintln!(
-                    "[verbose] Re-sending /stats session (buffer tail: {})",
-                    tail.replace('\n', "\\n")
-                );
-            }
-            send_gemini_stats_cmd(&session)?;
-            resent = true;
+        if handle_dialog_check(
+            &mut session,
+            detect_gemini_dialog,
+            "gemini",
+            config.approval_policy,
+            config.verbose,
+        )? {
+            // Dialog dismissed, re-send the command
+            session.send_keys_literal("/stats session")?;
+            std::thread::sleep(Duration::from_millis(500));
+            session.send_keys("Enter")?;
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
         }
 
         std::thread::sleep(poll_interval);

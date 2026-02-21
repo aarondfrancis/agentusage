@@ -15,8 +15,17 @@ static PROCESS_GROUPS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 const MAX_BUFFER_BYTES: usize = 1_000_000;
+
+/// Terminal queries we respond to, enabling Ink-based TUIs (Gemini) to
+/// complete their initialisation handshake without blocking indefinitely.
 const CURSOR_QUERY: &[u8] = b"\x1b[6n";
 const CURSOR_RESPONSE: &[u8] = b"\x1b[1;1R";
+/// Primary Device Attributes (DA1): `\x1b[c`
+const DA1_QUERY: &[u8] = b"\x1b[c";
+const DA1_RESPONSE: &[u8] = b"\x1b[?1;2c"; // VT100 with AVO
+/// Device Status Report (DSR): `\x1b[5n`
+const DSR_QUERY: &[u8] = b"\x1b[5n";
+const DSR_RESPONSE: &[u8] = b"\x1b[0n"; // terminal OK
 
 fn register_group(pgid: i32) {
     if let Ok(mut groups) = PROCESS_GROUPS.lock() {
@@ -64,11 +73,6 @@ pub fn clear_shutdown() {
     SHUTDOWN.store(false, Ordering::SeqCst);
 }
 
-/// Check whether the global shutdown flag is set.
-pub fn is_shutdown_requested() -> bool {
-    SHUTDOWN.load(Ordering::Relaxed)
-}
-
 fn map_special_key(keys: &str) -> &str {
     match keys {
         "Enter" => "\r",
@@ -82,16 +86,18 @@ fn map_special_key(keys: &str) -> &str {
     }
 }
 
-fn detect_cursor_query_and_update_tail(tail: &mut Vec<u8>, chunk: &[u8]) -> bool {
+/// Scan for `query` in the combined tail+chunk stream, updating the tail
+/// buffer for cross-chunk detection.  Returns true if the query was found.
+fn detect_query_in_stream(tail: &mut Vec<u8>, chunk: &[u8], query: &[u8]) -> bool {
     let mut combined = Vec::with_capacity(tail.len() + chunk.len());
     combined.extend_from_slice(tail);
     combined.extend_from_slice(chunk);
 
     let found = combined
-        .windows(CURSOR_QUERY.len())
-        .any(|window| window == CURSOR_QUERY);
+        .windows(query.len())
+        .any(|window| window == query);
 
-    let tail_len = CURSOR_QUERY.len().saturating_sub(1);
+    let tail_len = query.len().saturating_sub(1);
     tail.clear();
     if tail_len > 0 {
         if combined.len() >= tail_len {
@@ -111,6 +117,8 @@ pub struct PtySession {
     process_group: Option<i32>,
     buffer: Vec<u8>,
     cursor_query_tail: Vec<u8>,
+    da1_query_tail: Vec<u8>,
+    dsr_query_tail: Vec<u8>,
     cleaned_up: bool,
 }
 
@@ -258,6 +266,8 @@ impl PtySession {
             process_group,
             buffer: Vec::with_capacity(64 * 1024),
             cursor_query_tail: Vec::new(),
+            da1_query_tail: Vec::new(),
+            dsr_query_tail: Vec::new(),
             cleaned_up: false,
         })
     }
@@ -387,7 +397,7 @@ impl PtySession {
             };
             if n > 0 {
                 let chunk = &tmp[..n as usize];
-                self.maybe_respond_cursor_query(chunk);
+                self.respond_to_terminal_queries(chunk);
                 self.buffer.extend_from_slice(chunk);
                 self.trim_buffer();
                 continue;
@@ -411,9 +421,15 @@ impl PtySession {
         }
     }
 
-    fn maybe_respond_cursor_query(&mut self, chunk: &[u8]) {
-        if detect_cursor_query_and_update_tail(&mut self.cursor_query_tail, chunk) {
+    fn respond_to_terminal_queries(&mut self, chunk: &[u8]) {
+        if detect_query_in_stream(&mut self.cursor_query_tail, chunk, CURSOR_QUERY) {
             let _ = self.write_all_to_master(CURSOR_RESPONSE);
+        }
+        if detect_query_in_stream(&mut self.da1_query_tail, chunk, DA1_QUERY) {
+            let _ = self.write_all_to_master(DA1_RESPONSE);
+        }
+        if detect_query_in_stream(&mut self.dsr_query_tail, chunk, DSR_QUERY) {
+            let _ = self.write_all_to_master(DSR_RESPONSE);
         }
     }
 
@@ -542,7 +558,7 @@ mod tests {
     #[test]
     fn test_detect_cursor_query_in_single_chunk() {
         let mut tail = Vec::new();
-        let found = detect_cursor_query_and_update_tail(&mut tail, b"abc\x1b[6ndef");
+        let found = detect_query_in_stream(&mut tail, b"abc\x1b[6ndef", CURSOR_QUERY);
         assert!(found);
         assert_eq!(tail, b"def");
     }
@@ -550,11 +566,33 @@ mod tests {
     #[test]
     fn test_detect_cursor_query_split_across_chunks() {
         let mut tail = Vec::new();
-        let first = detect_cursor_query_and_update_tail(&mut tail, b"hello\x1b[");
+        let first = detect_query_in_stream(&mut tail, b"hello\x1b[", CURSOR_QUERY);
         assert!(!first);
-        let second = detect_cursor_query_and_update_tail(&mut tail, b"6nworld");
+        let second = detect_query_in_stream(&mut tail, b"6nworld", CURSOR_QUERY);
         assert!(second);
         assert_eq!(tail, b"rld");
+    }
+
+    #[test]
+    fn test_detect_da1_query() {
+        let mut tail = Vec::new();
+        let found = detect_query_in_stream(&mut tail, b"prefix\x1b[csuffix", DA1_QUERY);
+        assert!(found);
+    }
+
+    #[test]
+    fn test_detect_da1_no_false_positive_on_cursor_query() {
+        // \x1b[6n should NOT match DA1 (\x1b[c)
+        let mut tail = Vec::new();
+        let found = detect_query_in_stream(&mut tail, b"\x1b[6n", DA1_QUERY);
+        assert!(!found);
+    }
+
+    #[test]
+    fn test_detect_dsr_query() {
+        let mut tail = Vec::new();
+        let found = detect_query_in_stream(&mut tail, b"\x1b[5n", DSR_QUERY);
+        assert!(found);
     }
 
     #[test]

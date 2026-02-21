@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::Parser;
-use comfy_table::{presets::ASCII_BORDERS_ONLY_CONDENSED, Table};
+use comfy_table::{presets::ASCII_BORDERS_ONLY_CONDENSED, Cell, Color, Table};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::process::Command;
@@ -349,13 +349,14 @@ fn print_human(data: &UsageData) {
     ]);
 
     for entry in &data.entries {
+        let low = entry.percent_remaining < LOW_THRESHOLD;
         table.add_row(vec![
-            entry.label.clone(),
-            remaining_pct_cell(entry),
-            reset_days_cell(entry),
-            reset_minutes_cell(entry),
-            reset_hours_cell(entry),
-            spent_cell(entry),
+            make_cell(entry.label.clone(), low),
+            make_cell(remaining_pct_cell(entry), low),
+            make_cell(reset_days_cell(entry), low),
+            make_cell(reset_minutes_cell(entry), low),
+            make_cell(reset_hours_cell(entry), low),
+            make_cell(spent_cell(entry), low),
         ]);
     }
 
@@ -380,14 +381,15 @@ fn print_human_multi(results: &[UsageData]) {
     for (idx, data) in results.iter().enumerate() {
         let mut added_for_provider = 0usize;
         for entry in &data.entries {
+            let low = entry.percent_remaining < LOW_THRESHOLD;
             table.add_row(vec![
-                provider_label(&data.provider).to_string(),
-                entry.label.clone(),
-                remaining_pct_cell(entry),
-                reset_days_cell(entry),
-                reset_minutes_cell(entry),
-                reset_hours_cell(entry),
-                spent_cell(entry),
+                make_cell(provider_label(&data.provider).to_string(), low),
+                make_cell(entry.label.clone(), low),
+                make_cell(remaining_pct_cell(entry), low),
+                make_cell(reset_days_cell(entry), low),
+                make_cell(reset_minutes_cell(entry), low),
+                make_cell(reset_hours_cell(entry), low),
+                make_cell(spent_cell(entry), low),
             ]);
             row_count += 1;
             added_for_provider += 1;
@@ -421,6 +423,17 @@ fn provider_label(provider: &str) -> &str {
         "codex" => "Codex",
         "gemini" => "Gemini",
         _ => provider,
+    }
+}
+
+const LOW_THRESHOLD: u32 = 10;
+
+fn make_cell(text: String, low: bool) -> Cell {
+    let cell = Cell::new(text);
+    if low {
+        cell.fg(Color::Red)
+    } else {
+        cell
     }
 }
 
