@@ -76,7 +76,7 @@ where
                 bail!("[timeout] {}", dialog_error_message(&kind, provider));
             }
             ApprovalPolicy::Accept => {
-                let dismissed = dismiss_dialog(&kind, session)?;
+                let dismissed = dismiss_dialog(&kind, provider, session)?;
                 if !dismissed {
                     bail!("[timeout] {}", dialog_error_message(&kind, provider));
                 }
@@ -596,7 +596,7 @@ pub fn run_gemini(config: &UsageConfig) -> Result<UsageData> {
                     bail!("[timeout] {}", dialog_error_message(&kind, "gemini"));
                 }
                 ApprovalPolicy::Accept => {
-                    let dismissed = dismiss_dialog(&kind, &mut session)?;
+                    let dismissed = dismiss_dialog(&kind, "gemini", &mut session)?;
                     if !dismissed {
                         bail!("[timeout] {}", dialog_error_message(&kind, "gemini"));
                     }

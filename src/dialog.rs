@@ -26,11 +26,57 @@ fn is_auth_required_prompt(lower: &str) -> bool {
     AUTH_PHRASES.iter().any(|phrase| lower.contains(phrase))
 }
 
+fn looks_like_update_prompt(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    lower.contains("update available") || lower.contains("new version")
+}
+
+fn has_numbered_skip_option(content: &str) -> bool {
+    let compact: String = content
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    compact.contains("2.skip")
+}
+
+fn dismiss_codex_update_prompt(session: &mut Session) -> Result<bool> {
+    // Never accept updates on behalf of the user.
+    // Try escape first, then explicit skip selection for numbered menus.
+    session.send_keys("Esc")?;
+    thread::sleep(Duration::from_millis(250));
+
+    let mut content = session.capture_pane()?;
+    if content.contains("? for shortcuts") {
+        return Ok(true);
+    }
+
+    if has_numbered_skip_option(&content) {
+        session.send_keys_literal("2")?;
+        thread::sleep(Duration::from_millis(100));
+        session.send_keys("Enter")?;
+        thread::sleep(Duration::from_millis(400));
+
+        content = session.capture_pane()?;
+        if content.contains("? for shortcuts") {
+            return Ok(true);
+        }
+    }
+
+    // Fallback for menus without numeric shortcuts: move away from "Update now".
+    session.send_keys("Down")?;
+    thread::sleep(Duration::from_millis(120));
+    session.send_keys("Enter")?;
+    thread::sleep(Duration::from_millis(400));
+
+    Ok(true)
+}
+
 /// Detect Claude-specific dialogs in screen content.
 pub fn detect_claude_dialog(content: &str) -> Option<DialogKind> {
     let lower = content.to_lowercase();
 
-    if lower.contains("update available") || lower.contains("new version") {
+    if looks_like_update_prompt(content) {
         return Some(DialogKind::UpdatePrompt);
     }
     if is_auth_required_prompt(&lower) {
@@ -86,9 +132,7 @@ pub fn detect_gemini_dialog(content: &str) -> Option<DialogKind> {
     }
     // Priority 3: Update available → UpdatePrompt
     // Exclude extension update notices (informational, not interactive dialogs)
-    if (lower.contains("update available") || lower.contains("new version"))
-        && !lower.contains("extension")
-    {
+    if looks_like_update_prompt(content) && !lower.contains("extension") {
         return Some(DialogKind::UpdatePrompt);
     }
     // Priority 4: Terms acceptance → TermsAcceptance
@@ -149,14 +193,17 @@ pub fn dialog_error_message(kind: &DialogKind, provider: &str) -> String {
 /// Attempt to dismiss a dialog by sending Enter.
 /// Returns Ok(true) if the dialog is dismissible (Enter sent),
 /// Ok(false) if it requires manual intervention (auth, first-run).
-pub fn dismiss_dialog(kind: &DialogKind, session: &mut Session) -> Result<bool> {
+pub fn dismiss_dialog(kind: &DialogKind, provider: &str, session: &mut Session) -> Result<bool> {
     match kind {
         DialogKind::AuthRequired | DialogKind::FirstRunSetup => Ok(false),
         DialogKind::UpdatePrompt => {
-            // Never accept updates on behalf of the user; press Escape to skip
-            session.send_keys("Escape")?;
-            thread::sleep(Duration::from_secs(1));
-            Ok(true)
+            if provider == "codex" {
+                dismiss_codex_update_prompt(session)
+            } else {
+                session.send_keys("Esc")?;
+                thread::sleep(Duration::from_secs(1));
+                Ok(true)
+            }
         }
         _ => {
             session.send_keys("Enter")?;
@@ -354,6 +401,18 @@ mod tests {
             detect_codex_dialog("Please ACCEPT the TERMS"),
             Some(DialogKind::TermsAcceptance)
         );
+    }
+
+    #[test]
+    fn test_has_numbered_skip_option_codex_menu() {
+        let content = "1. Update now\n2. Skip\n3. Skip until next version";
+        assert!(has_numbered_skip_option(content));
+    }
+
+    #[test]
+    fn test_has_numbered_skip_option_handles_compact_capture() {
+        let content = "1.Updatenow2.Skip3.Skipuntilnextversion";
+        assert!(has_numbered_skip_option(content));
     }
 
     #[test]

@@ -28,3 +28,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Gemini CLI prompt and dialog detection hardened for v0.28+
 - Reset time parser supports compact formats without spaces (e.g., `Resets10pm(...)`)
 - PTY `openpty` call passes explicit mut winsize pointer for correctness
+- Codex update prompts now reliably dismiss via non-update options (Skip), avoiding automatic updates on behalf of users
